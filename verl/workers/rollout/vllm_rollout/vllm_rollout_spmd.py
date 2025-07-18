@@ -36,6 +36,7 @@ from copy import deepcopy
 from types import MethodType
 from typing import Any
 
+import ipdb
 import numpy as np
 import ray
 import torch
@@ -334,18 +335,37 @@ class vLLMRollout(BaseRollout):
                     response.append(response_ids)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+                        if self.config.logprobs > 0:
+                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                item = []
+                                for k, v in logprob.items():
+                                    item.append([k, v.logprob])
+                                    if len(item) >= self.config.logprobs:
+                                        break
+                                curr_log_prob.append(item)
+                                if len(item) != self.config.logprobs:
+                                    print(len(item))
+                                    exit(1)
+                            rollout_log_probs.append(curr_log_prob)
+                        else:
+                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
             )
             if self.config.calculate_log_probs:
-                rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
-                ).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
+                if self.config.logprobs > 0:
+                    pad_item = [[-1, -1]] * self.config.logprobs
+                    for i in range(len(rollout_log_probs)):
+                        rollout_log_probs[i] = rollout_log_probs[i] + [pad_item] * (self.config.response_length - len(rollout_log_probs[i]))
+                    rollout_log_probs = torch.tensor(rollout_log_probs).to(torch.float32)
+                else:
+                    rollout_log_probs = pad_2d_list_to_length(
+                        rollout_log_probs, -1, max_length=self.config.response_length
+                    ).to(idx.device)
+                    rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             seq = torch.cat([idx, response], dim=-1)
 
