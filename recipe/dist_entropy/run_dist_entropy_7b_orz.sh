@@ -68,9 +68,9 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=1  # train_batch_size
+train_prompt_bsz=64  # train_batch_size
 gen_prompt_bsz=$((train_prompt_bsz * 3))
-n_resp_per_prompt=8
+n_resp_per_prompt=16
 train_prompt_mini_bsz=32
 
 # Ray
