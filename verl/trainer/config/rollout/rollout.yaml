@@ -113,8 +113,6 @@ val_kwargs:
   # Whether to sample during training rollout. False uses greedy sampling.
   do_sample: False
 
-logprobs: 20
-
 # Multi-turn interaction config for tools or chat.
 multi_turn:
 
@@ -164,7 +162,7 @@ multi_turn:
   format: hermes
 
 # support logging rollout prob for debugging purpose
-calculate_log_probs: True
+calculate_log_probs: False
 
 # [Experimental] agent loop based rollout configs
 agent:
