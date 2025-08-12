@@ -1,3 +1,4 @@
+import ipdb
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
@@ -25,6 +26,7 @@ prompt = (
 
 # Tokenize and generate
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+ipdb.set_trace()
 outputs = model.generate(
     **inputs,
     max_new_tokens=1024,

@@ -28,8 +28,7 @@ from verl.utils.device import is_cuda_available
 
 from .dist_entropy_ray_trainer import RayDistEntropyTrainer
 
-
-@hydra.main(config_path="config", config_name="dapo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="dist_entropy_trainer", version_base=None)
 def main(config):
     run_ppo(config)
 
@@ -122,12 +121,10 @@ class TaskRunner:
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
             if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
+                from recipe.dist_entropy.GeneralVerifierWorker import GeneralVerifierWorker
             else:
                 raise NotImplementedError
-            role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+            role_worker_mapping[Role.RewardModel] = ray.remote(GeneralVerifierWorker)
             mapping[Role.RewardModel] = global_pool_id
         else:
             print('reward model is disabled')

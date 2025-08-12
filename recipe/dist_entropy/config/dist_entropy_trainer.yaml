@@ -8,14 +8,60 @@ defaults:
 
 data:
   gen_batch_size: ${data.train_batch_size}
+  return_raw_chat: False
 
 reward_model:
   reward_manager: dapo
+  model:
+    input_tokenizer: null
   overlong_buffer: 
     enable: False # We try to avoid forgetting to set enable
     len: 0
     penalty_factor: 0.0
     log: False
+  rollout:
+    name: vllm
+    mode: sync
+    temperature: 1.0
+    top_k: -1
+    top_p: 1
+    prompt_length: 1024
+    response_length: 1024
+    dtype: bfloat16
+    gpu_memory_utilization: 0.5
+    ignore_eos: False
+    enforce_eager: True
+    free_cache_engine: False
+    tensor_model_parallel_size: 2
+    max_num_batched_tokens: 8192
+    max_model_len: null
+    max_num_seqs: 1024
+    load_format: dummy_dtensor
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: null
+    log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,false}
+    log_prob_max_token_len_per_gpu: ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
+    disable_log_stats: True
+    do_sample: True
+    n: 1
+    multi_stage_wake_up: false
+    engine_kwargs:
+      vllm:
+        swap_space: null
+        disable_mm_preprocessor_cache: False
+    val_kwargs:
+      top_k: -1
+      top_p: 1.0
+      temperature: 0
+      n: 1
+      do_sample: False
+    calculate_log_probs: False
+    agent:
+      num_workers: 8
+      custom_async_server:
+        path: null
+        name: null
+
 
 algorithm:
   filter_groups:
@@ -23,6 +69,11 @@ algorithm:
     enable: False # We try to avoid forgetting to set enable
     metric: null # acc / score / seq_reward / seq_final_reward / ...
     max_num_gen_batches: 0 # Non-positive values mean no upper limit
+
+actor_rollout_ref:
+    rollout:
+      logprobs: 20
+      calculate_log_probs: True
 
 trainer:
   project_name: verl-dapo

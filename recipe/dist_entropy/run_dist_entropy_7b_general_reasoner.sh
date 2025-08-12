@@ -17,6 +17,7 @@ n_gpus_per_node=${devices_num}
 if [ "$devices_num" -lt 2 ]; then
     tensor_model_parallel_size=1
 else
+#    tensor_model_parallel_size=$devices_num
     tensor_model_parallel_size=2
 fi
 sp_size=$((n_gpus_per_node / tensor_model_parallel_size))
@@ -45,7 +46,7 @@ output_path=$HOME/jyh/verl/output
 set -xeuo pipefail
 
 project_name=dist_entropy
-experiment_name=dist_entropy_ORZ-7B
+experiment_name=dist_entropy_GR-7B # dist_entropy_7b_general_reasoner
 
 adv_estimator=grpo
 
@@ -79,12 +80,13 @@ train_prompt_mini_bsz=32
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
 # Paths
-model_path=$HOME/jyh/llm_models/Open-Reasoner-Zero/Open-Reasoner-Zero-7B
+model_path=$HOME/jyh/llm_models/TIGER-Lab/General-Reasoner-Qwen2.5-7B
+reward_model_path=$HOME/jyh/llm_models/TIGER-Lab/general-verifier
 default_local_dir=${output_path}/${project_name}/${experiment_name}
 log_filename=${log_path}/${project_name}/${experiment_name}.log
 mkdir -p ${log_path}/${project_name}
-train_files=${data_path}/dist_entropy_math_1k.parquet
-test_files=${data_path}/aime-2024.parquet
+train_files=${data_path}/rlpr_train.parquet
+test_files=${data_path}/aime-2024.parquet # 不重要
 
 
 # 算法
@@ -109,6 +111,7 @@ PYTHONUNBUFFERED=1 \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
+    data.return_raw_chat=True \
     data.max_response_length=${max_response_length} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -143,8 +146,8 @@ PYTHONUNBUFFERED=1 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=${tensor_model_parallel_size} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${tensor_model_parallel_size}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     actor_rollout_ref.rollout.temperature=${temperature} \
@@ -162,6 +165,18 @@ PYTHONUNBUFFERED=1 \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
+    reward_model.model.path="${reward_model_path}" \
+    reward_model.enable=True \
+    +reward_model.rollout.enable_chunked_prefill=True \
+    reward_model.rollout.temperature=${temperature} \
+    reward_model.rollout.top_p=${top_p} \
+    reward_model.rollout.top_k="${top_k}" \
+    reward_model.rollout.val_kwargs.temperature=${temperature} \
+    reward_model.rollout.val_kwargs.top_p=${top_p} \
+    reward_model.rollout.val_kwargs.top_k=${top_k} \
+    reward_model.rollout.val_kwargs.do_sample=True \
+    reward_model.rollout.val_kwargs.n=1 \
+    +reward_model.tensor_model_parallel_size="${tensor_model_parallel_size}" \
     trainer.logger=['console'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \

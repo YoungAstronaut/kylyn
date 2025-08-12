@@ -15,7 +15,9 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
+import json
 import os.path
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -24,8 +26,11 @@ from pprint import pprint
 import ipdb
 import numpy as np
 import torch
+from exceptiongroup import catch
 from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
+import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -41,6 +46,9 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.utils import hf_tokenizer
+from verl.utils.device import get_device_id
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
 
@@ -378,9 +386,22 @@ class RayDistEntropyTrainer(RayPPOTrainer):
     def sample_traindataset(self):
         self.train_dataset.dataframe = self.train_dataset.dataframe.select(range(1000))
         df = self.train_dataset.dataframe.to_pandas()
-        df.to_parquet("dist_entropy_math_1k.parquet")
+        df.to_parquet("dist_entropy_rlpr_1k.parquet")
         print('输出1k.parquet文件')
         exit(0)
+
+    def general_reasoner_compute_score(
+        self,
+        solution_str,
+    ):
+        solution_slices = solution_str.strip().split('\n')
+        final_decision = solution_slices[-1].strip()
+        if final_decision == 'Final Decision: Yes':
+            return 1
+        elif final_decision == 'Final Decision: No':
+            return -1
+        else:
+            return 0
 
     def generate_responses(self):
         """
@@ -465,14 +486,20 @@ class RayDistEntropyTrainer(RayPPOTrainer):
                 new_batch = new_batch.union(gen_batch_output)
 
                 # calculate reward
+                reward_model_responses = None
                 with marked_timer("reward", timing_raw, "yellow"):
                     # compute scores. Support both model and function-based.
                     # We first compute the scores using reward model. Then, we call reward_fn to combine
                     # the results from reward model and rule-based results.
                     if self.use_rm:
-                        # we first compute reward model score
-                        reward_tensor = self.rm_wg.compute_rm_score(new_batch)
-                        new_batch = new_batch.union(reward_tensor)
+                        reward_results = self.rm_wg.compute_rm_score(new_batch)
+                        reward_model_responses = reward_results.non_tensor_batch["reward_model_responses"]
+                        prompt_length = new_batch.batch['prompts'].shape[-1]
+                        reward_tensor = torch.zeros_like(new_batch.batch['responses'], dtype=torch.float32)
+                        for i in range(len(reward_model_responses)):
+                            valid_response_length = new_batch.batch["attention_mask"][i][prompt_length:].sum()
+                            reward_tensor[i, valid_response_length-1] = self.general_reasoner_compute_score(reward_model_responses[i])
+                            new_batch.batch.update({'rm_scores': reward_tensor})
 
                     # we combine with rule-based rm
                     reward_extra_infos_dict: dict[str, list]
@@ -504,7 +531,6 @@ class RayDistEntropyTrainer(RayPPOTrainer):
                         new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
                 batch = new_batch
-                ipdb.set_trace()
 
                 batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -519,7 +545,21 @@ class RayDistEntropyTrainer(RayPPOTrainer):
                 # compute global_valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                print(batch.batch)
                 torch.save(batch.batch, os.path.join(self.config.trainer.default_local_dir, f'{self.global_steps}.pt'))
+                if self.use_rm:
+                    try:
+                        file_path = os.path.join(self.config.trainer.default_local_dir, f'{self.global_steps}.json')
+                        with open(file_path, 'w', encoding='utf-8') as file:
+                            json_content = {'reward_model_output': reward_model_responses.tolist(),
+                                            'reward_info': batch.non_tensor_batch['reward_model'].tolist(),
+                                            'raw_prompts': batch.non_tensor_batch['raw_prompt'].tolist(),
+                                            }
+                            json.dump(json_content, file, ensure_ascii=False, indent=4)
+                            print(f"列表已成功保存到 {file_path}")
+                    except Exception as e:
+                        print(f"保存文件时出错: {e}")
+                print('Successfully saved batch')
 
             with marked_timer("stop_profile", timing_raw):
                 if do_profile:
@@ -531,12 +571,7 @@ class RayDistEntropyTrainer(RayPPOTrainer):
                     if self.use_rm:
                         self.rm_wg.stop_profile()
 
-            # collect metrics
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             # TODO: implement actual tflpo and theoretical tflpo
-            n_gpus = self.resource_pool_manager.get_n_gpus()
-            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
             timing_raw = defaultdict(float)  # clear timing
 
             metrics["train/num_gen_batches"] = num_gen_batches
