@@ -118,6 +118,9 @@ ENV/
 
 # data
 *.parquet
+data/*.csv
+data/*.json
+data/*.jsonl
 
 
 # local logs
