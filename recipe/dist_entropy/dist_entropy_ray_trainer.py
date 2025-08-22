@@ -184,7 +184,6 @@ class RayDistEntropyTrainer(RayPPOTrainer):
                             reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
                         except Exception as e:
                             print(f"Error in reward_fn: {e}")
-                            reward_tensor = self.reward_fn(new_batch)
                             reward_extra_infos_dict = {}
 
                         new_batch.batch["token_level_scores"] = reward_tensor
