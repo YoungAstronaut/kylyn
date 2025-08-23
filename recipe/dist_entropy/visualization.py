@@ -3,7 +3,7 @@ import os
 from tensordict import TensorDict
 from vllm.transformers_utils.tokenizer import encode_tokens
 
-project_name = 'dist_entropy_ORZ-7B'
+project_name = 'dist_entropy_Qwen2.5-0.5B'
 data_path = f'/home/hzchen/jyh/verl/output/dist_entropy/{project_name}'
 
 data_num = 5
@@ -13,6 +13,7 @@ for i in range(data_num):
     data = torch.load(file_path, map_location=torch.device('cpu'), weights_only=False)
     print(type(data))  # 应输出 <class 'tensordict.TensorDict'>
     print(data.keys())
+    print(data)
     data_tensors.append(data)
     
 from transformers import AutoTokenizer
