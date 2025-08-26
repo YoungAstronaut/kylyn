@@ -56,6 +56,7 @@ def compute_score(
         res = prime_math.compute_score(solution_str, ground_truth)
     else:
         if solution_str == None:
+            print("\033[31mthis solution is None!\033[0m")
             res = -1.0
             return res
 
@@ -159,25 +160,34 @@ class RuleBasedRewardManager():
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             data_source = data_item.non_tensor_batch['data_source']
 
+            solution_str = ''
             if '<think>' in response_str and '</think>' in response_str:
                 solution_str = response_str.split('</think>')[1]
             if '\\boxed' in solution_str:
                 solution_str = last_boxed_only_string(solution_str)
-            
-            score = compute_score(data_source, solution_str, ground_truth)
+            if solution_str == '':
+                score = -1.0
+                print('response not contain solution')
+                print('response: ', response_str)
+            else:
+                score = compute_score(data_source, solution_str, ground_truth)
+                print('solution str: ', solution_str)
+            print('ground truth: ', ground_truth)
+            print('score: ', score)
             reward_tensor[i, valid_response_length - 1] = score
+            reward_extra_info['acc'].append(score == 1.0)
             
             # 进行回答长度过长惩罚
-            if self.overlong_buffer_cfg.enable:
-                overlong_buffer_len = self.overlong_buffer_cfg.len
-                expected_len = self.max_resp_len - overlong_buffer_len
-                exceed_len = valid_response_length - expected_len
-                overlong_penalty_factor = self.overlong_buffer_cfg.penalty_factor
-                overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
-                score += overlong_reward
-                if self.overlong_buffer_cfg.log:
-                    reward_extra_info["overlong_reward"].append(overlong_reward)
-                    reward_extra_info["overlong"].append(overlong_reward < 0)
+            # if self.overlong_buffer_cfg.enable:
+            #     overlong_buffer_len = self.overlong_buffer_cfg.len
+            #     expected_len = self.max_resp_len - overlong_buffer_len
+            #     exceed_len = valid_response_length - expected_len
+            #     overlong_penalty_factor = self.overlong_buffer_cfg.penalty_factor
+            #     overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+            #     score += overlong_reward
+            #     if self.overlong_buffer_cfg.log:
+            #         reward_extra_info["overlong_reward"].append(overlong_reward)
+            #         reward_extra_info["overlong"].append(overlong_reward < 0)
 
 
             # 进行回答打印，只打印num_engine个回答的答案
@@ -190,7 +200,7 @@ class RuleBasedRewardManager():
                 print("[ground_truth]", ground_truth)
                 print("[score]", score)
 
-        return reward_tensor
+        return reward_tensor, reward_extra_info
     
 if __name__ == "__main__":
     data_source = 'no_source'
@@ -203,4 +213,5 @@ if __name__ == "__main__":
         solution_str = last_boxed_only_string(solution_str)
     
     score = compute_score(data_source, solution_str, ground_truth)
+    score = compute_score(data_source, 'x^2 + 2x - 2', 'x^{2}+2x-2')
     print(score)
