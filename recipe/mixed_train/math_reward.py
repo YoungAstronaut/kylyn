@@ -163,11 +163,11 @@ class RuleBasedRewardManager():
             solution_str = ''
             if '<think>' in response_str and '</think>' in response_str:
                 solution_str = response_str.split('</think>')[1]
-            if '\\boxed' in solution_str:
-                solution_str = last_boxed_only_string(solution_str)
+            if '\\boxed' in response_str:
+                solution_str = last_boxed_only_string(response_str)
             if solution_str == '':
                 score = -1.0
-                print('response not contain solution')
+                print('response not contain solution: ')
                 print('response: ', response_str)
             else:
                 score = compute_score(data_source, solution_str, ground_truth)
@@ -215,3 +215,5 @@ if __name__ == "__main__":
     score = compute_score(data_source, solution_str, ground_truth)
     score = compute_score(data_source, 'x^2 + 2x - 2', 'x^{2}+2x-2')
     print(score)
+    test_str = "Thus, the original function's equation is \(\\boxed{y = x^2 + 2x - 2}\)."
+    print(last_boxed_only_string(test_str))
