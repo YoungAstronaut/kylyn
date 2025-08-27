@@ -9,6 +9,10 @@ defaults:
 data:
   gen_batch_size: ${data.train_batch_size}
   return_raw_chat: False
+  filter_prompts: True
+  max_target_length: 8192
+  filter_targets: False
+  sample_target_ratio: 1.0
 
 reward_model:
   reward_manager: dapo
@@ -29,9 +33,30 @@ algorithm:
     max_num_gen_batches: 0 # Non-positive values mean no upper limit
 
 actor_rollout_ref:
-    rollout:
-      logprobs: 20
-      calculate_log_probs: True
+  rollout:
+    logprobs: 20
+    calculate_log_probs: False
+    n_off_policy: 1
+  actor:
+    use_off_policy_loss: False
+    off_policy_normalize: False
+    off_policy_loss_impl: token
+    off_policy_cliprange: 0.2
+    use_off_policy_probs: False
+    use_off_policy_clip: False
+    off_policy_max_clip: -1
+    off_policy_min_clip: -1
+    off_policy_reshape: "no_reshape"
+    off_policy_reshape_weight: 0.1
+    off_policy_reshape_pow_exp: 0.5
+    on_policy_reshape: "no_reshape"
+    on_policy_reshape_weight: 0.1
+    on_policy_reshape_pow_exp: 0.5
+    calculate_sft_loss: True
+    all_max_clip: -1
+    loss_remove_token_mean: False
+    loss_remove_clip: False
+    sft_loss_coef: 0.1 # 仅在calculate_sft_loss为True时生效
 
 trainer:
   project_name: verl-dapo
