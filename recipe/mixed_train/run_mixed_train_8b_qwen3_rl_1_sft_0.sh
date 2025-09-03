@@ -17,8 +17,7 @@ n_gpus_per_node=${devices_num}
 if [ "$devices_num" -lt 2 ]; then
     tensor_model_parallel_size=1
 else
-    # tensor_model_parallel_size=2
-    tensor_model_parallel_size=$devices_num
+    tensor_model_parallel_size=4
 fi
 sp_size=1
 echo "tensor_model_parallel_size: ${tensor_model_parallel_size}"
@@ -34,12 +33,12 @@ echo "sp_size: ${sp_size}"
 # export CUDA_VISIBLE_DEVICES="0,1"
 
 ### ray
-ray stop --force
+# ray stop --force
 
-CUDA_VISIBLE_DEVICES=${devices} ray start \
-    --head \
-    --num-gpus ${devices_num} \
-    --ray-debugger-external
+# CUDA_VISIBLE_DEVICES=${devices} ray start \
+#     --head \
+#     --num-gpus ${devices_num} \
+#     --ray-debugger-external
 
 #### 不改的目录
 log_path=$HOME/jyh/verl/log
@@ -74,10 +73,10 @@ loss_agg_mode="token-mean"
 enable_filter_groups=False
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=32  # train_batch_size
+train_prompt_bsz=64  # train_batch_size
 gen_prompt_bsz=64
 n_resp_per_prompt=8
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=16
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -104,12 +103,10 @@ actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
 
-# gen_tp=4
-
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
 #     --working-dir "${WORKING_DIR}" \
-PYTHONUNBUFFERED=1 \
-    python3 -m recipe.mixed_train.main_mixed_train \
+# PYTHONUNBUFFERED=1 \
+python3 -m recipe.mixed_train.main_mixed_train \
     data.train_files="${train_files}" \
     data.val_files="${test_files}" \
     data.prompt_key=prompt \
@@ -120,11 +117,12 @@ PYTHONUNBUFFERED=1 \
     data.max_target_length=8192 \
     data.train_batch_size=${train_prompt_bsz} \
     data.val_batch_size=${train_prompt_bsz} \
-    actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
-    actor_rollout_ref.rollout.n_off_policy=0 \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.norm_adv_by_std_in_grpo=False \
+    actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    actor_rollout_ref.rollout.n_off_policy=0 \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -134,17 +132,14 @@ PYTHONUNBUFFERED=1 \
     actor_rollout_ref.actor.off_policy_normalize=False \
     actor_rollout_ref.actor.off_policy_reshape="p_div_p_0.1" \
     actor_rollout_ref.actor.off_policy_loss_impl=token \
-    actor_rollout_ref.actor.calculate_sft_loss=True \
+    actor_rollout_ref.actor.calculate_sft_loss=False \
     actor_rollout_ref.actor.sft_loss_coef=0.1 \
-    algorithm.filter_groups.enable=${enable_filter_groups} \
-    algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
-    algorithm.filter_groups.metric=${filter_groups_metric} \
-    algorithm.norm_adv_by_std_in_grpo=False \
+    actor_rollout_ref.actor.calculate_rl_loss=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${model_path}" \
@@ -173,9 +168,8 @@ PYTHONUNBUFFERED=1 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=32 \
     actor_rollout_ref.actor.loss_remove_token_mean=True \
-    actor_rollout_ref.actor.loss_remove_clip=True \
     reward_model.reward_manager=dapo \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
