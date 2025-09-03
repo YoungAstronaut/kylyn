@@ -123,8 +123,6 @@ class TaskRunner:
             role_worker_mapping[Role.RefPolicy] = ray.remote(MixedTrainActorRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
-        from verl.workers.reward_manager import get_reward_manager_cls
-
         # Note(haibin.lin): please make sure custom reward managers are imported and
         # registered via `verl.workers.reward_manager.register`
         from .math_reward import RuleBasedRewardManager

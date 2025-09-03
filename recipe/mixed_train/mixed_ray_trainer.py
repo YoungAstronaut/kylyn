@@ -63,7 +63,6 @@ class RayMixedTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
-        print('\033[32mtype of dataset: \033[0m', type(self.train_dataset))
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -109,17 +108,11 @@ class RayMixedTrainer(RayPPOTrainer):
                             self.rm_wg.start_profile()
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
-                print('new batch: ', new_batch.batch)
-                print('batch keys of new batch: ', new_batch.batch.keys())
-                print('non tensor batch keys of new batch: ', new_batch.non_tensor_batch.keys())
                 num_gen_batches += 1
                 # pop those keys for generation
                 gen_batch = new_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
                 )
-                print('gen batch: ', gen_batch.batch)
-                print('batch keys of gen batch: ', gen_batch.batch.keys())
-                print('non tensor batch keys of gen batch: ', gen_batch.non_tensor_batch.keys())
 
                 # interleave==True: [a, b] -> [a, a, b, b]
                 # interleave==False: [a, b] -> [a, b, a, b]
@@ -127,20 +120,15 @@ class RayMixedTrainer(RayPPOTrainer):
                     repeat_times=self.config.actor_rollout_ref.rollout.n-self.config.actor_rollout_ref.rollout.n_off_policy, 
                     interleave=True
                 )
-                print('n: ', self.config.actor_rollout_ref.rollout.n)
-                print('n_off_policy: ', self.config.actor_rollout_ref.rollout.n_off_policy)
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        print('gen batch after repeat: ', gen_batch)
-                        print('batch keys of gen batch after repeat: ', gen_batch.batch.keys())
-                        print('non tensor batch keys of gen batch after repeat: ', gen_batch.non_tensor_batch.keys())
+                        print('gen batch after repeat: ', gen_batch.batch)
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        print('gen batch output: ', gen_batch_output)
-                        print('batch keys of gen batch output: ', gen_batch_output.batch.keys())
-                        print('non tensor batch keys of gen batch output: ', gen_batch_output.non_tensor_batch.keys())
+                        print('gen batch output: ', gen_batch_output.batch)
                         # 这一部分返回只有五项：
                         # prompts: Tensor(shape=torch.Size([24, 2048]),),
                         # responses: Tensor(shape=torch.Size([24, 20480]),),
@@ -221,7 +209,7 @@ class RayMixedTrainer(RayPPOTrainer):
                             gen_batch_mixed_output = DataProto.from_single_dict(gen_batch_mixed_output)
                         else:                           
                             gen_batch_mixed_output = gen_batch_output
-                            prefix_mask = torch.zeros_like(gen_batch_mixed_output.batch['responses'], dtype=torch.int32)
+                            prefix_mask = torch.zeros_like(gen_batch_mixed_output.batch['responses'], dtype=torch.int64)
                             gen_batch_mixed_output.batch['prefix_mask'] = prefix_mask
                         
                         timing_raw.update(gen_batch_mixed_output.meta_info["timing"])
@@ -413,6 +401,7 @@ class RayMixedTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
+                            print('batch before update actor ', batch.batch)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
