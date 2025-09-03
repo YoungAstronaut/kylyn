@@ -167,13 +167,13 @@ class RuleBasedRewardManager():
                 solution_str = last_boxed_only_string(response_str)
             if solution_str == '':
                 score = -1.0
-                print('response not contain solution: ')
-                print('response: ', response_str)
+                # print('response not contain solution: ')
+                # print('response: ', response_str)
             else:
                 score = compute_score(data_source, solution_str, ground_truth)
-                print('solution str: ', solution_str)
-            print('ground truth: ', ground_truth)
-            print('score: ', score)
+                # print('solution str: ', solution_str)
+            # print('ground truth: ', ground_truth)
+            # print('score: ', score)
             reward_tensor[i, valid_response_length - 1] = score
             reward_extra_info['acc'].append(score == 1.0)
             
