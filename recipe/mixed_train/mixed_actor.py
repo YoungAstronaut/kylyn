@@ -20,9 +20,12 @@ Single Process Actor
 import itertools
 import logging
 import os
+from contextlib import nullcontext
+
 import numpy as np
 
 import torch
+from ray.train.v2.torch.train_loop_utils import backward
 from torch import nn
 from torch import distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -51,6 +54,11 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+EPS = 1e-12
+
+def _to_f32(x):
+    return x.detach().to(torch.float32)
 
 def gather_sft_tensor(data, prompt_length, tgt_inputs_length, pad_token_id):
     sft_responses = data['tgt_input_ids']
@@ -103,7 +111,7 @@ def analyze_gradients(sft_grads, rl_grads):
 def compute_sft_loss(log_prob, mask):
     assert log_prob.shape == mask.shape, f'log_prob shape {log_prob.shape} does not match mask shape {mask.shape}'
     valid_tokens = torch.sum(mask).item()
-    print(f"SFT有效token数量: {valid_tokens}")
+    # print(f"SFT有效token数量: {valid_tokens}")
     return -torch.sum(log_prob * mask) / torch.sum(mask)
 
 def compute_token_mixed_policy_loss(
@@ -156,7 +164,7 @@ def compute_token_mixed_policy_loss(
     negative_approx_kl = log_prob - old_log_prob
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
     rl_valid_tokens = torch.sum(eos_mask).item()
-    print(f"RL有效token数量: {rl_valid_tokens}")
+    # print(f"RL有效token数量: {rl_valid_tokens}")
 
     # TODO: 测试on-policy是否需要shape
     # if on_policy_reshape == "no_reshape":
@@ -194,7 +202,7 @@ def compute_token_mixed_policy_loss(
     on_pg_losses = torch.max(on_pg_losses, on_pg_losses2)
     on_pg_loss = verl_F.masked_mean(on_pg_losses, eos_mask)
     pg_loss = on_pg_loss
-    
+
     # compute off-policy loss
     # TODO: 研究一下off-policy是否需要shape和不同strategy的作用
     # off_ratio = torch.exp(log_prob) # [bsz, l]
@@ -216,14 +224,14 @@ def compute_token_mixed_policy_loss(
     #     off_ratio = torch.pow(off_ratio, off_policy_reshape_pow_exp)
     # else:
     #     raise ValueError(f"Invalid off_policy_reshape: {off_policy_reshape}")
-        
+
     # clip off-policy ratio
     # if off_max_clip is not None:
     #     off_ratio = torch.clamp(off_ratio, max=off_max_clip)
     #     off_ratio_max_clip_frac = verl_F.masked_mean((off_ratio == off_max_clip).float(), prefix_mask * eos_mask)
     # else:
     #     off_ratio_max_clip_frac = torch.tensor(0.0)
-        
+
     # if off_min_clip is not None:
     #     off_ratio = torch.clamp(off_ratio, min=off_min_clip)
     #     off_ratio_min_clip_frac = verl_F.masked_mean((off_ratio == off_min_clip).float(), prefix_mask * eos_mask)
@@ -239,10 +247,10 @@ def compute_token_mixed_policy_loss(
     # if off_pg_loss.isnan().item() is True:
     #     off_pg_loss = torch.tensor(0.0)
     # off_pg_clipfrac = torch.tensor(0.0)
-    
+
     # prefix_mask = prefix_mask.float()
     # pg_losses = off_pg_losses * prefix_mask + on_pg_losses * (1 - prefix_mask)
-    
+
     # log on/off probs
     # off_policy_probs = torch.exp(log_prob)
     # off_policy_prob = verl_F.masked_mean(off_policy_probs, prefix_mask * eos_mask)
@@ -252,13 +260,13 @@ def compute_token_mixed_policy_loss(
     # on_policy_prob = verl_F.masked_mean(on_policy_probs, (1.0-prefix_mask) * eos_mask)
     # if on_policy_prob.isnan().item() is True:
     #     on_policy_prob = torch.tensor(0.0)
-            
+
     # if all_max_clip is not None:
     #     p_on = torch.exp(log_prob)
     #     p_on_mask = (p_on <= all_max_clip).float()
     #     eos_mask = eos_mask * p_on_mask
     #     pg_losses = pg_losses * p_on_mask
-        
+
     # if loss_remove_token_mean is True:
     #     pg_loss = (pg_losses * eos_mask).sum() / eos_mask.shape[-1]
     #     print(f'no token mean: mean normalization {eos_mask.shape[-1]}')
@@ -280,14 +288,15 @@ def compute_token_mixed_policy_loss(
     #     "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
     # }
 
-def rearrange_micro_batches_with_tgts(
+def rearrange_micro_batches_with_targets(
     batch,
-    uids,
     max_token_len,
     dp_group=None,
     num_batches_divided_by=None,
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
+    with_sft=True,
+    with_rl=True
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -299,6 +308,8 @@ def rearrange_micro_batches_with_tgts(
         num_batches_divided_by (optional): virtual pipeline parallel size, for megatron.
         same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
+        with_sft:
+        with_rl:
 
     Returns:
         List[TensorDict]: the micro-batches.
@@ -309,7 +320,14 @@ def rearrange_micro_batches_with_tgts(
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
     )
-    seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+    if not with_sft and with_rl:
+        seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+    elif with_rl and with_sft:
+        seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)+batch["tgt_attention_mask"].sum(dim=1)
+    elif with_sft and not with_rl:
+        seq_len_effective: torch.Tensor = batch["tgt_attention_mask"].sum(dim=1)
+    else:
+        raise ValueError("with_sft and with_rl cannot be both False")
     total_seqlen = seq_len_effective.sum().item()
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
@@ -329,20 +347,34 @@ def rearrange_micro_batches_with_tgts(
     micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
 
     micro_batches = []
-    micro_uids_batches = []
 
     for partition in micro_bsz_idx:
         curr_micro_batch = []
-        curr_uids_batch = []
         for idx in partition:
             curr_micro_batch.append(batch[idx : idx + 1])
-            curr_uids_batch.append(uids[idx])
         curr_micro_batch = torch.cat(curr_micro_batch)
 
         micro_batches.append(curr_micro_batch)
-        micro_uids_batches.append(curr_uids_batch)
 
-    return micro_batches, micro_bsz_idx, micro_uids_batches
+    return micro_batches, micro_bsz_idx
+
+def convert_data(data):
+    if isinstance(data, DataProto):
+        result = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
+    elif isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                result[k] = v.to(get_device_id())
+            elif k == "multi_modal_inputs" and v is not None:
+                result[k] = [
+                    {kk: vv.to(get_device_id()) for kk, vv in item_dict.items()} for item_dict in v
+                ]
+            else:
+                result[k] = v
+    else:
+        result = data.to(get_device_id())  # actor device is cpu when using offload
+    return result
 
 class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
@@ -362,35 +394,38 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             "old_log_probs",
             "advantages",
             "tgt_input_ids",
+            "tgt_attention_mask",
+            "tgt_responses"
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         select_data = data.select(batch_keys=select_keys)
         batch = select_data.batch
-        non_tensor_batch = select_data.non_tensor_batch
-        print(f'non tensors batch keys: {non_tensor_batch.keys()}')
-        for k, v in batch.items():
-            print(f'{k}: {v.shape}')
+        # non_tensor_batch = select_data.non_tensor_batch
+        # print(f'non tensors batch keys: {non_tensor_batch.keys()}')
+        # for k, v in batch.items():
+        #     print(f'{k}: {v.shape}')
         # print(non_tensor_batch['uid'])
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        print('ppo mini batch: ', self.config.ppo_mini_batch_size)
-        print('length of mini batch: ', len(dataloader))
+        # print('ppo mini batch: ', self.config.ppo_mini_batch_size)
+        # print('length of mini batch: ', len(dataloader))
         metrics = {}
         print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
                 mini_batch = data
-                print(type(mini_batch))
-                print('mini batch: ', mini_batch)
+                # print('mini batch: ', mini_batch)
                 if self.config.use_dynamic_bsz:
-                    print('ppo_max_token_len_per_gpu: ', self.config.ppo_max_token_len_per_gpu)
+                    # print('ppo_max_token_len_per_gpu: ', self.config.ppo_max_token_len_per_gpu)
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = rearrange_micro_batches_with_targets(
+                        batch=mini_batch, max_token_len=max_token_len,
+                        with_sft=self.config.calculate_sft_loss, with_rl=self.config.calculate_rl_loss)
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -398,58 +433,140 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                # TODO: 调试用，后面应该移除
-                # print('before split: ', mini_batch)
-                # micro_batches = mini_batch.split(4, dim=0)
-                # print('after split: ', micro_batches)
                 self.actor_optimizer.zero_grad()
 
-                print('length of micro batches: ', len(micro_batches))
-                for data in micro_batches:
-                    micro_batch_metrics = {}
+                responses_length = micro_batches[0]["responses"].shape[1]
+                prompt_length = micro_batches[0]["input_ids"].shape[1] - responses_length
+                clip_ratio = self.config.clip_ratio
+                clip_ratio_low = (
+                    self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                )
+                clip_ratio_high = (
+                    self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                )
+                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
 
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
-                    elif isinstance(data, dict):
-                        for k, v in data.items():
-                            if isinstance(v, torch.Tensor):
-                                data[k] = v.to(get_device_id())
-                            elif k == "multi_modal_inputs" and v is not None:
-                                data[k] = [
-                                    {kk: vv.to(get_device_id()) for kk, vv in item_dict.items()} for item_dict in v
-                                ]
-                            else:
-                                data[k] = v
-                    else:
-                        data = data.to(get_device_id())  # actor device is cpu when using offload
-                    for k, v in data.items():
-                        print('key: ', k, ' shape: ', v.shape)
+                micro_batches = [convert_data(batch) for batch in micro_batches]
+
+                mini_batch_metrics = {}
+
+                if self.config.calculate_sft_loss and self.config.calculate_rl_loss and self.config.need_analyze_gradients:
+                    def _grab_grads_recompute(which: str, batch_data: TensorDict, response: torch.Tensor,):
+                        self.actor_optimizer.zero_grad(set_to_none=True)
+                        _, all_log_prob_tmp = self._forward_micro_batch(
+                            micro_batch=batch_data, temperature=temperature
+                        )
+                        if which == "sft":
+                            loss_scalar = compute_sft_loss(all_log_prob_tmp, response)
+                        else:  # "pg"
+                            loss_scalar, _, _, _ = compute_token_mixed_policy_loss(
+                                old_log_prob=batch_data["old_log_probs"],
+                                log_prob=all_log_prob_tmp,
+                                advantages=batch_data["advantages"],
+                                eos_mask=response,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ration_c=clip_ratio_c,
+                                off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
+                                off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
+                                all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
+                                on_policy_reshape=self.config.on_policy_reshape,
+                                on_policy_reshape_weight=self.config.on_policy_reshape_weight,
+                                on_policy_reshape_pow_exp=self.config.on_policy_reshape_pow_exp,
+                                off_policy_reshape=self.config.off_policy_reshape,
+                                off_policy_reshape_weight=self.config.off_policy_reshape_weight,
+                                off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
+                                loss_remove_token_mean=self.config.loss_remove_token_mean,
+                                loss_remove_clip=self.config.loss_remove_clip,
+                            )
+                        loss_scalar.backward()
+                        # 3) 取出梯度并清理
+                        params = [p for p in self.actor_module.parameters() if p.requires_grad]
+                        grads = [None if p.grad is None else p.grad.detach().clone() for p in params]
+                        self.actor_optimizer.zero_grad(set_to_none=True)
+                        return grads
+
+                    sft_batch_data = micro_batches[0].clone()
+                    sft_batch_data = TensorDict(
+                        {'input_ids': sft_batch_data["tgt_input_ids"],
+                         'attention_mask': sft_batch_data["tgt_attention_mask"],
+                         'position_ids': sft_batch_data["position_ids"],
+                         'responses': sft_batch_data["tgt_responses"], }
+                    )
+                    sft_batch_data['response_mask'] = sft_batch_data['attention_mask'][:, prompt_length:]
+                    grads_sft = _grab_grads_recompute("sft", sft_batch_data, sft_batch_data['response_mask']) \
+                        if self.config.calculate_sft_loss else None
+
+                    rl_batch_data = micro_batches[0].clone()
+                    rl_batch_data = TensorDict(
+                        {'input_ids': rl_batch_data["input_ids"],
+                         'attention_mask': rl_batch_data["attention_mask"],
+                         'position_ids': rl_batch_data["position_ids"],
+                         'responses': rl_batch_data["responses"],
+                         'old_log_probs': rl_batch_data["old_log_probs"],
+                         'advantages': rl_batch_data["advantages"], }
+                    )
+                    rl_batch_data['response_mask'] = rl_batch_data['attention_mask'][:, prompt_length:]
+                    grads_pg = _grab_grads_recompute("pg", rl_batch_data, rl_batch_data['response_mask'])\
+                        if self.config.calculate_rl_loss else None
+
+                    param_names = [n for n, p in self.actor_module.named_parameters() if p.requires_grad]
+                    # 注意：参数遍历顺序与 .parameters() 一致；在 _grab_grads_recompute 里按 .parameters() 采集的 grads_* 与这里顺序是对齐的
+                    # print('param_names: ', param_names)
+                    per_param_rows = []
+                    for name, g1, g2 in zip(param_names, grads_sft, grads_pg):
+                        if g1 is None or g2 is None:
+                            per_param_rows.append({
+                                "name": name, "cos": None, "angle_deg": None,
+                                "norm_sft": 0.0 if g1 is None else _to_f32(g1).norm().item(),
+                                "norm_pg": 0.0 if g2 is None else _to_f32(g2).norm().item(),
+                            })
+                            continue
+                        a = _to_f32(g1).reshape(-1)
+                        b = _to_f32(g2).reshape(-1)
+                        dot = (a * b).sum()
+                        n1 = a.norm().clamp_min(EPS)
+                        n2 = b.norm().clamp_min(EPS)
+                        cos = (dot / (n1 * n2)).clamp(-1 + 1e-6, 1 - 1e-6)
+                        angle = torch.rad2deg(torch.acos(cos))
+
+                        per_param_rows.append({
+                            "name": name,
+                            "cos": cos.item(),
+                            "angle_deg": angle.item(),
+                            "norm_sft": n1.item(),
+                            "norm_pg": n2.item(),
+                        })
+
+                    for i, r in enumerate(per_param_rows):
+                        mini_batch_metrics[f"actor/pp_cos_{i}"] = r["cos"]
+                        mini_batch_metrics[f"actor/pp_ang_{i}"] = r["angle_deg"]
+                        mini_batch_metrics[f"actor/pp_n_sft_{i}"] = r["norm_sft"]
+                        mini_batch_metrics[f"actor/pp_n_pg_{i}"] = r["norm_pg"]
+                        # 也可把名字打印到日志
+                        print(f"[Param {i}] {r['name']} cos={r['cos']:.4f} angle={r['angle_deg']:.1f}° "
+                              f"||sft||={r['norm_sft']:.3e} ||pg||={r['norm_pg']:.3e}")
+
+                    del grads_sft, grads_pg
+                    torch.cuda.empty_cache()
+
+                for index, data in enumerate(micro_batches):
+                    micro_batch_metrics = {}
                     
                     # TODO: 将data翻倍，前一半是rl，后一半是sft。input_ids, attention_mask, position_ids, responses这四个成员需要翻倍
-                    responses_length = data["responses"].shape[1]
-                    prompt_length = data["input_ids"].shape[1] - responses_length
-                    tgt_inputs_length = data["tgt_input_ids"].shape[1]
-                    assert responses_length == tgt_inputs_length, "responses_length and tgt_inputs_length must be equal"
-                    pad_positions = (data['attention_mask'] == 0)
-                    pad_token_id = data['input_ids'][pad_positions].unique().item()
-                    print('pad token id: ', pad_token_id)
-
-                    sft_input_ids, sft_attention_mask, sft_position_ids, sft_responses = gather_sft_tensor(
-                        data, prompt_length, tgt_inputs_length, pad_token_id
-                    )
 
                     if self.config.calculate_sft_loss and self.config.calculate_rl_loss:
                         forward_batch_data = TensorDict(
-                            {'input_ids': torch.cat([data["input_ids"], sft_input_ids], dim=0),
-                            'attention_mask': torch.cat([data["attention_mask"], sft_attention_mask], dim=0),
-                            'position_ids': torch.cat([data["position_ids"], sft_position_ids], dim=0),
-                            'responses': torch.cat([data["responses"], sft_responses], dim=0),
+                            {'input_ids': torch.cat([data["input_ids"], data["tgt_input_ids"]], dim=0),
+                            'attention_mask': torch.cat([data["attention_mask"], data["tgt_attention_mask"]], dim=0),
+                            'position_ids': torch.cat([data["position_ids"], data["position_ids"]], dim=0),
+                            'responses': torch.cat([data["responses"], data["tgt_responses"]], dim=0),
                             'old_log_probs': torch.cat([data["old_log_probs"], data["old_log_probs"]], dim=0),
                             'advantages': torch.cat([data["advantages"], data["advantages"]], dim=0),}
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        policy_mask = torch.cat([torch.ones_like(data["response_mask"]), torch.zeros_like(sft_responses)], dim=0).bool()
+                        policy_mask = torch.cat([torch.ones_like(data["response_mask"]), torch.zeros_like(data["response_mask"])], dim=0).bool()
                         old_log_prob = forward_batch_data["old_log_probs"]
                         advantages = forward_batch_data["advantages"]
                     elif not self.config.calculate_sft_loss and self.config.calculate_rl_loss:
@@ -467,118 +584,67 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         advantages = forward_batch_data["advantages"]
                     elif self.config.calculate_sft_loss and not self.config.calculate_rl_loss:
                         forward_batch_data = TensorDict(
-                            {'input_ids': sft_input_ids,
-                            'attention_mask': sft_attention_mask,
-                            'position_ids': sft_position_ids,
-                            'responses': sft_responses}
+                            {'input_ids': data["tgt_input_ids"],
+                            'attention_mask': data["tgt_attention_mask"],
+                            'position_ids': data["position_ids"],
+                            'responses': data["tgt_responses"],}
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        policy_mask = torch.zeros_like(sft_responses).bool()
+                        policy_mask = torch.zeros_like(data["tgt_responses"]).bool()
                     else:
                         raise ValueError('both sft loss and rl loss are not calculated')
-                    
-                    for  k, v in forward_batch_data.items():
-                        print('forward batch data key: ', k, ' forward batch data shape: ', v.shape)
+                    response_mask = forward_batch_data["response_mask"]
 
                     # all return: (bsz, response_length)
                     entropy, all_log_prob = self._forward_micro_batch(
                         micro_batch=forward_batch_data, temperature=temperature
                     )
-                    print(f"前向传播后显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
-                    print('forward results ************ ')
-                    print('all log prob: ', all_log_prob.shape)
-
-                    response_mask = forward_batch_data["response_mask"]
-
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = (
-                        self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    )
-                    clip_ratio_high = (
-                        self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    )
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
 
                     if self.config.calculate_sft_loss:
-                        sft_log_prob = all_log_prob[~policy_mask]
-                        sft_response_mask = response_mask[~policy_mask]
-                        sft_valid_tokens = torch.sum(sft_response_mask).item()
-                        print(f"SFT总token数量: {sft_valid_tokens}")
-                        max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                        sft_loss_calcuated_times = sft_valid_tokens // max_token_len + 1
-                        print(f"SFT计算次数: {sft_loss_calcuated_times}")
-                        for i in range(sft_loss_calcuated_times):
-                            sft_start = i * max_token_len
-                            sft_end = (i + 1) * max_token_len
-                            sft_loss = compute_sft_loss(sft_log_prob[sft_start:sft_end], sft_response_mask[sft_start:sft_end]) / sft_loss_calcuated_times
-                            print(f'第{i}次sft loss: ', sft_loss.item())
-                            # if i == sft_loss_calcuated_times - 1:
-                            #     sft_loss.backward()
-                            # else:
-                            #     sft_loss.backward(retain_graph=True)
-                            sft_loss.backward()
-                            print(f'成功计算第{i}次sft loss')
-                            break
-                        sft_grads= None
-                        # sft_loss.backward()
-                        # sft_grads = {name: param.grad.detach().cpu().clone() for name, param in self.actor_module.named_parameters()}  
-                        # for name, grad in self.actor_module.named_parameters():
-                        #     print('grad before zero: ', name, ' : ', torch.norm(grad, p=2).item())
-                        torch.cuda.empty_cache()
-                        self.actor_optimizer.zero_grad()  # 清空梯度  
- 
+                        sft_loss = compute_sft_loss(all_log_prob[~policy_mask], response_mask[~policy_mask]) * self.config.sft_loss_coef
+                        # print('sft loss: ', sft_loss)
                     else:
                         sft_loss = torch.tensor(0.0, device=get_device_id())
-                        sft_grads = None
 
                     if self.config.calculate_rl_loss:
-                        # pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl = compute_token_mixed_policy_loss(old_log_prob=old_log_prob[policy_mask], 
-                        #     log_prob=all_log_prob[policy_mask],
-                        #     advantages=advantages[policy_mask],
-                        #     eos_mask=response_mask[policy_mask],
-                        #     cliprange=clip_ratio,
-                        #     cliprange_low=clip_ratio_low,
-                        #     cliprange_high=clip_ratio_high,
-                        #     clip_ration_c=clip_ratio_c,
-                        #     off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
-                        #     off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
-                        #     all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
-                        #     on_policy_reshape=self.config.on_policy_reshape,
-                        #     on_policy_reshape_weight=self.config.on_policy_reshape_weight,
-                        #     on_policy_reshape_pow_exp=self.config.on_policy_reshape_pow_exp,
-                        #     off_policy_reshape=self.config.off_policy_reshape,
-                        #     off_policy_reshape_weight=self.config.off_policy_reshape_weight,
-                        #     off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
-                        #     loss_remove_token_mean=self.config.loss_remove_token_mean,
-                        #     loss_remove_clip=self.config.loss_remove_clip
-                        # )
-                        pg_loss = compute_sft_loss(all_log_prob[policy_mask], response_mask[policy_mask])
-                        pg_loss.backward()
-                        print('pg loss: ', pg_loss, ' pg_loss.shape: ', pg_loss.shape)
-                        # data = {
-                        #     'actor/on_pg_loss': on_pg_loss.detach().item(),
-                        #     'actor/on_pg_clipfrac': on_pg_clipfrac.detach().item(),
-                        # }
-                        # append_to_dict(metrics, data)
-                        # 计算RL Loss梯度  
-                        rl_grads = None
-                        # pg_loss.backward()
-                        print('finished pg loss backward')
-                        # pg_loss.backward(retain_graph=True)
-                        # rl_grads = {name: param.grad.detach().cpu().clone() for name, param in self.actor_module.named_parameters()}
-                        # torch.cuda.empty_cache()
-                        # self.actor_optimizer.zero_grad()  # 清空梯度
+                        pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl = compute_token_mixed_policy_loss(old_log_prob=old_log_prob[policy_mask],
+                            log_prob=all_log_prob[policy_mask],
+                            advantages=advantages[policy_mask],
+                            eos_mask=response_mask[policy_mask],
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ration_c=clip_ratio_c,
+                            off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
+                            off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
+                            all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
+                            on_policy_reshape=self.config.on_policy_reshape,
+                            on_policy_reshape_weight=self.config.on_policy_reshape_weight,
+                            on_policy_reshape_pow_exp=self.config.on_policy_reshape_pow_exp,
+                            off_policy_reshape=self.config.off_policy_reshape,
+                            off_policy_reshape_weight=self.config.off_policy_reshape_weight,
+                            off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
+                            loss_remove_token_mean=self.config.loss_remove_token_mean,
+                            loss_remove_clip=self.config.loss_remove_clip
+                        )
+                        # print('pg loss: ', pg_loss, ' pg_loss.shape: ', pg_loss.shape)
+                        data = {
+                            'actor/on_pg_loss': on_pg_loss.detach().item(),
+                            'actor/on_pg_clipfrac': on_pg_clipfrac.detach().item(),
+                        }
+                        append_to_dict(metrics, data)
                     else:
+                        pg_loss = torch.tensor(0.0, device=get_device_id())
                         print('not calculate rl loss')
-
-                    if sft_grads and rl_grads:
-                        gradient_analysis = analyze_gradients(sft_grads, rl_grads)
 
                     # TODO: 看看适应性温度的影响，可以参考：/home/hzchen/jyh/LUFFY-main/luffy/verl/verl/mix_src/mix_actor.py
                     # 中的 205 行开始的内容
 
                     if self.config.calculate_sft_loss and self.config.calculate_rl_loss:
-                        all_loss = pg_loss + sft_loss * self.config.sft_loss_coef
+                        if self.config.sft_loss_coef < 1e-4:
+                            all_loss = pg_loss
+                        else:
+                            all_loss = pg_loss + sft_loss * self.config.sft_loss_coef
                     elif self.config.calculate_sft_loss and not self.config.calculate_rl_loss:
                         all_loss = sft_loss * self.config.sft_loss_coef
                     elif not self.config.calculate_sft_loss and self.config.calculate_rl_loss:
@@ -601,15 +667,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         micro_batch_metrics.update(
                             {
                                 "actor/pg_loss": pg_loss.detach().item(),
-                                # "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/ppo_kl": ppo_kl.detach().item(),
                             }
                         )
-
 
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                mini_batch_metrics["actor/grad_norm"] = grad_norm.detach().item()
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
