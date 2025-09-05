@@ -114,7 +114,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.gen_batch_size=${gen_prompt_bsz} \
-    data.max_target_length=8192 \
+    data.max_target_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
     data.val_batch_size=${train_prompt_bsz} \
     algorithm.adv_estimator=${adv_estimator} \
@@ -132,8 +132,8 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.actor.off_policy_normalize=False \
     actor_rollout_ref.actor.off_policy_reshape="p_div_p_0.1" \
     actor_rollout_ref.actor.off_policy_loss_impl=token \
-    actor_rollout_ref.actor.calculate_sft_loss=False \
-    actor_rollout_ref.actor.sft_loss_coef=0.1 \
+    actor_rollout_ref.actor.calculate_sft_loss=True \
+    actor_rollout_ref.actor.sft_loss_coef=0 \
     actor_rollout_ref.actor.calculate_rl_loss=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -180,7 +180,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.nnodes="${nnodes}" \
     trainer.val_before_train=False \
-    trainer.test_freq=5 \
+    trainer.test_freq=1 \
     trainer.save_freq=-1 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${default_local_dir}" \
