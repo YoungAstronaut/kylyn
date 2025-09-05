@@ -165,11 +165,18 @@ class RLHFDatasetWithTarget(RLHFDataset):
         else:
             assert self.truncation in ('right', 'error')
             tgt_input_ids = tgt_input_ids[:, :self.max_target_length]
-        
+
         tgt_input_ids = tgt_input_ids.squeeze(0)
 
-        row_dict['tgt_input_ids'] = tgt_input_ids
-        
+        row_dict['tgt_responses'] = tgt_input_ids.detach().clone()
+        cloned_input_id = input_ids[0].detach().clone()
+        cloned_tgt_part = tgt_input_ids.detach()
+        tgt_input_ids = torch.cat([cloned_input_id, cloned_tgt_part], dim=-1)
+
+        tgt_attention_mask = (tgt_input_ids != self.tokenizer.pad_token_id).int().detach().clone()
+        row_dict['tgt_input_ids'] = tgt_input_ids.detach().clone()
+        row_dict['tgt_attention_mask'] = tgt_attention_mask.clone()
+
         # process target_list
         if getattr(self, 'target_list_key', "target_list_key") in row_dict:
             target_list = row_dict.pop(self.target_list_key)
