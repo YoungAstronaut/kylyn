@@ -1,10 +1,6 @@
 from collections import defaultdict
-import re
 from verl import DataProto
 import torch
-from typing import List, Optional, Union
-
-from verl.utils.tokenizer import hf_tokenizer
 
 from recipe.mixed_train.utils import grade_answer_mathd, grade_answer_sympy
 
@@ -32,15 +28,15 @@ def compute_score(
     """
     res = -1.0
     if data_source == "openai/gsm8k":
-        from . import gsm8k
+        from verl.utils.reward_score import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval"]:
-        from . import math
+        from verl.utils.reward_score import math
 
         res = math.compute_score(solution_str, ground_truth)
     elif data_source == "math_dapo" or data_source.startswith("aime"):
-        from . import math_dapo
+        from verl.utils.reward_score import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
     elif data_source in [
@@ -51,7 +47,7 @@ def compute_score(
         "numina_cn_k12",
         "numina_olympiads",
     ]:
-        from . import prime_math
+        from verl.utils.reward_score import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
     else:
@@ -170,11 +166,18 @@ class RuleBasedRewardManager():
                 # print('response not contain solution: ')
                 # print('response: ', response_str)
             else:
-                score = compute_score(data_source, solution_str, ground_truth)
+                result = compute_score(data_source, solution_str, ground_truth)
+                if isinstance(result, float):
+                    score = result
+                elif isinstance(result, dict):
+                    score = result['score']
+                else:
+                    raise NotImplementedError(f'Un recognized result type: {type(result)}')
                 # print('solution str: ', solution_str)
+                reward_tensor[i, valid_response_length - 1] = score
             # print('ground truth: ', ground_truth)
             # print('score: ', score)
-            reward_tensor[i, valid_response_length - 1] = score
+
             reward_extra_info['acc'].append(score == 1.0)
             
             # 进行回答长度过长惩罚
