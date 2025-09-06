@@ -11,11 +11,11 @@
 while [[ $# -gt 0 ]]; do
     case $1 in
         --calculate_rl)
-            CALCULATE_RL="true"
+            CALCULATE_RL="True"
             shift
             ;;
         --calculate_sft)
-            CALCULATE_SFT="true"
+            CALCULATE_SFT="True"
             shift
             ;;
         --sft_coef)
@@ -29,6 +29,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+CALCULATE_RL=${CALCULATE_RL:-"False"}
+CALCULATE_SFT=${CALCULATE_SFT:-"False"}
+SFT_COEF="${SFT_COEF:-0.0}"
 echo "Input arguments"
 echo "CALCULATE_RL: $CALCULATE_RL"
 echo "CALCULATE_SFT: $CALCULATE_SFT"
@@ -70,4 +73,8 @@ CUDA_VISBLE_DEVICES=0,1,2,3 ray start --head --num-gpus 4
 sleep 30
 
 cd /home/jwangxgroup/yuhang/jyh/verl
-bash recipe/mixed_train/run_mixed_train_8b_qwen3_rl_1_sft_0.sh 0,1,2,3
+bash recipe/mixed_train/run_mixed_train_8b_qwen3_rl_1_sft_0.sh \
+  --devices 0,1,2,3 \
+  --calculate_rl "$CALCULATE_RL" \
+  --calculate_sft "$CALCULATE_SFT" \
+  --sft_coef "$SFT_COEF"

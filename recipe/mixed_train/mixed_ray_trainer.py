@@ -2,22 +2,15 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-import json
-import os.path
-import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
 
-import ipdb
 import numpy as np
 import torch
-from exceptiongroup import catch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
-import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.protocol import unpad_dataproto, pad_dataproto_to_divisor
 from verl.trainer.ppo.core_algos import agg_loss
@@ -34,9 +27,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
-from verl.utils import hf_tokenizer
-from verl.utils.device import get_device_id
-from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
 
@@ -478,6 +468,7 @@ class RayMixedTrainer(RayPPOTrainer):
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            # print('shape of test batch: ', test_batch)
 
             # repeat test batch
             test_batch = test_batch.repeat(
@@ -560,6 +551,7 @@ class RayMixedTrainer(RayPPOTrainer):
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            break
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 

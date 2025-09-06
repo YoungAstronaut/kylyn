@@ -1,16 +1,40 @@
 #!/usr/bin/env bash
 
 
-## 设备相关
-devices=$1
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --devices)
+            echo "设备列表: ${2}"
+            devices_num=$(echo "$2" | tr ',' ' ' | wc -w)
+            echo "设备数量: ${devices_num}"
+            shift 2
+            ;;
+        --calculate_rl)
+            calculate_rl_loss="$2"
+            echo "计算 RL 损失: ${calculate_rl_loss}"
+            shift 2
+            ;;
+        --calculate_sft)
+            calculate_sft_loss="$2"
+            echo "计算 SFT 损失: ${calculate_sft_loss}"
+            shift 2
+            ;;
+        --sft_coef)
+            sft_coef="$2"
+            echo "SFT 损失系数: ${sft_coef}"
+            shift 2
+            ;;
+        *)
+            echo "Unknown parameter: $1"
+            exit 1
+            ;;
+    esac
+done
 
-if [ -z "$devices" ]; then
-    echo "Error: devices 参数为空!"
-    exit 1
-fi
-
-devices_num=$(echo "$devices" | tr ',' ' ' | wc -w)
-echo "设备数量: ${devices_num}"
+calculate_rl_loss=${calculate_rl_loss:-"False"}
+calculate_sft_loss=${calculate_sft_loss:-"False"}
+sft_coef=${sft_coef:-"0.0"}
 
 nnodes=1
 n_gpus_per_node=${devices_num}
@@ -74,6 +98,7 @@ enable_filter_groups=False
 filter_groups_metric=acc
 max_num_gen_batches=10
 train_prompt_bsz=64  # train_batch_size
+val_batch_size=256
 gen_prompt_bsz=64
 n_resp_per_prompt=8
 train_prompt_mini_bsz=16
@@ -116,7 +141,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.max_target_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
-    data.val_batch_size=${train_prompt_bsz} \
+    data.val_batch_size=${val_batch_size} \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
@@ -132,9 +157,9 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.actor.off_policy_normalize=False \
     actor_rollout_ref.actor.off_policy_reshape="p_div_p_0.1" \
     actor_rollout_ref.actor.off_policy_loss_impl=token \
-    actor_rollout_ref.actor.calculate_sft_loss=True \
-    actor_rollout_ref.actor.sft_loss_coef=0 \
-    actor_rollout_ref.actor.calculate_rl_loss=True \
+    actor_rollout_ref.actor.calculate_sft_loss="${calculate_sft_loss}" \
+    actor_rollout_ref.actor.sft_loss_coef="${sft_coef}" \
+    actor_rollout_ref.actor.calculate_rl_loss="${calculate_rl_loss}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
