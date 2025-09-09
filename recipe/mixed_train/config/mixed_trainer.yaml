@@ -58,7 +58,7 @@ actor_rollout_ref:
     loss_remove_clip: False
     sft_loss_coef: 0.1 # 仅在calculate_sft_loss为True时生效
     calculate_rl_loss: True
-    need_analyze_gradients: True
+    need_analyze_gradients: False
 
 trainer:
   project_name: verl-dapo

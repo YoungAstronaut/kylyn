@@ -41,7 +41,7 @@ n_gpus_per_node=${devices_num}
 if [ "$devices_num" -lt 2 ]; then
     tensor_model_parallel_size=1
 else
-    tensor_model_parallel_size=4
+    tensor_model_parallel_size=2
 fi
 sp_size=1
 echo "tensor_model_parallel_size: ${tensor_model_parallel_size}"
@@ -124,7 +124,6 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 
 # Performance 相关超参
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
 
@@ -142,6 +141,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     data.max_target_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
     data.val_batch_size=${val_batch_size} \
+    data.validation_shuffle=True \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
@@ -182,7 +182,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${tensor_model_parallel_size} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k="${top_k}" \
@@ -193,7 +193,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=32 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
     actor_rollout_ref.actor.loss_remove_token_mean=True \
     reward_model.reward_manager=dapo \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
