@@ -16,38 +16,30 @@
 """
 Single Process Actor
 """
-
-import itertools
+import hashlib
+import json
 import logging
 import os
+import time
 from contextlib import nullcontext
-
-import numpy as np
+from pathlib import Path
 
 import torch
-from ray.train.v2.torch.train_loop_utils import backward
-from torch import nn
 from torch import distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tensordict import TensorDict
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
-from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import ceildiv, get_reverse_idx, get_seqlen_balanced_partitions, rearrange_micro_batches, roundup_divisible
-from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
-from verl.workers.actor import BasePPOActor
+from verl.utils.seqlen_balancing import ceildiv, get_seqlen_balanced_partitions, roundup_divisible
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
-if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-elif is_npu_available:
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+# if is_cuda_available:
+#     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+# elif is_npu_available:
+#     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
 
 __all__ = ["DataParallelPPOActor"]
@@ -71,6 +63,20 @@ def gather_sft_tensor(data, prompt_length, tgt_inputs_length, pad_token_id):
     print('sft responses: ', sft_responses.shape)
 
     return sft_input_ids, sft_attention_mask, sft_position_ids, sft_responses
+
+def calculate_cos_and_angle(a, b):
+    n1 = a.norm().clamp_min(EPS)
+    n2 = b.norm().clamp_min(EPS)
+    cos = ((a * b).sum() / (n1 * n2)).clamp(-1 + 1e-6, 1 - 1e-6)
+    angle = torch.rad2deg(torch.acos(cos))
+    return cos, angle
+
+def _safe_angle_from_cos(cos_val: float):
+    if cos_val is None:
+        return None
+    t = torch.tensor(cos_val, dtype=torch.float32, device=get_device_id())
+    t = t.clamp(-1 + 1e-6, 1 - 1e-6)
+    return torch.rad2deg(torch.acos(t)).item()
 
 def analyze_gradients(sft_grads, rl_grads):
     results = {}
@@ -110,7 +116,7 @@ def analyze_gradients(sft_grads, rl_grads):
 
 def compute_sft_loss(log_prob, mask):
     assert log_prob.shape == mask.shape, f'log_prob shape {log_prob.shape} does not match mask shape {mask.shape}'
-    valid_tokens = torch.sum(mask).item()
+    # valid_tokens = torch.sum(mask).item()
     # print(f"SFT有效token数量: {valid_tokens}")
     return -torch.sum(log_prob * mask) / torch.sum(mask)
 
@@ -163,7 +169,7 @@ def compute_token_mixed_policy_loss(
 
     negative_approx_kl = log_prob - old_log_prob
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
-    rl_valid_tokens = torch.sum(eos_mask).item()
+    # rl_valid_tokens = torch.sum(eos_mask).item()
     # print(f"RL有效token数量: {rl_valid_tokens}")
 
     # TODO: 测试on-policy是否需要shape
@@ -376,7 +382,371 @@ def convert_data(data):
         result = data.to(get_device_id())  # actor device is cpu when using offload
     return result
 
+
+def _sanitize_name(name: str) -> str:
+    # 便于作为文件名（尽量短）
+    base = name.replace("/", "_").replace(".", "_").replace(" ", "_")
+    h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{base}__{h}"
+
+
 class MixedTrainParallelPPOActor(DataParallelPPOActor):
+
+    def _precondition_grad(self, g, p, param_eps):
+        """
+        用 Adam/AdamW 的二阶动量对梯度做预条件： g / (sqrt(v) + eps)
+        - v 优先取 amsgrad 的 max_exp_avg_sq，否则取 exp_avg_sq
+        - 若拿不到 state（比如第一步），返回 None 表示无法预条件
+        """
+        if g is None:
+            return None
+        state = self.actor_optimizer.state.get(p, None)
+        if not state:
+            return None
+        v = state.get("max_exp_avg_sq", None)
+        if v is None:
+            v = state.get("exp_avg_sq", None)
+        if v is None:
+            return None
+        eps = param_eps.get(p, 1e-8)
+        g32 = _to_f32(g)
+        v32 = _to_f32(v)
+        # 设备对齐
+        if v32.device != g32.device:
+            v32 = v32.to(g32.device)
+        denom = torch.sqrt(v32).add(eps)
+        # 避免不必要的显存放大
+        return g32 / denom
+    
+    def _global_cos_and_angle(self, vec_a: torch.Tensor, vec_b: torch.Tensor, EPS: float = 1e-12, group=None):
+        # vec_* 一维或可展平向量（已在同一 device）
+        a = vec_a.reshape(-1).float()
+        b = vec_b.reshape(-1).float()
+        # 局部部分和
+        local_dot   = (a * b).sum()
+        local_n1_sq = (a * a).sum()
+        local_n2_sq = (b * b).sum()
+        # 分布式聚合：把所有 rank 的部分和相加得到全局和
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_dot,   op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(local_n1_sq, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(local_n2_sq, op=dist.ReduceOp.SUM, group=group)
+        # 用全局的和计算余弦与角度/范数
+        n1 = local_n1_sq.sqrt().clamp_min(EPS)
+        n2 = local_n2_sq.sqrt().clamp_min(EPS)
+        cos = (local_dot / (n1 * n2 + EPS)).clamp(-1 + 1e-6, 1 - 1e-6)
+        angle = torch.rad2deg(torch.acos(cos))
+        return cos, angle, n1, n2
+
+    def _grab_grads_recompute(
+            self,
+            which: str,  # "sft" / "pg"
+            batch_data: TensorDict,
+            response: torch.Tensor,
+            temperature: float,
+            clip_ratio=0.2, clip_ratio_low=0.2, clip_ratio_high=0.2, clip_ratio_c=3.0,
+            *,
+            dp_no_sync: bool = False,  # <== 关键：False 表示做 reduce-scatter，得到“分片梯度”
+            return_grads: bool = False,  # 多数情况下我们直接落盘，不返回大列表
+            save_dir: str | None = None,  # 不为 None 时落盘
+            save_cpu_dtype: torch.dtype = torch.float16,
+            per_param_files: bool = True,
+            save_optimizer_state: bool = False,  # 如需离线做预条件余弦，建议 True
+    ):
+        """
+        计算一次 SFT/PG 的纯净梯度（与优化器状态一致的“分片梯度”），并可选直接落盘。
+        - 当 save_dir 不为 None 时：流式拷贝到 CPU 并保存文件；返回 manifest（小字典）
+        - 当 return_grads 为 True 时：返回 grads(list[Tensor|None])（不建议与 save_dir 同时用）
+        """
+        assert which in ("sft", "pg")
+        assert not (save_dir and return_grads), "建议二选一：要么落盘，要么返回列表"
+
+        # FSDP/DDP 同步控制（False -> 同步 -> shard grads）
+        no_sync_ctx = getattr(self.actor_module, "no_sync", None)
+        sync_ctx = no_sync_ctx() if (dp_no_sync and no_sync_ctx is not None) else nullcontext()
+
+        self.actor_optimizer.zero_grad(set_to_none=True)
+
+        with sync_ctx:
+            _, all_log_prob_tmp = self._forward_micro_batch(
+                micro_batch=batch_data, temperature=temperature
+            )
+            if which == "sft":
+                loss_scalar = compute_sft_loss(all_log_prob_tmp, response)
+            else:
+                loss_scalar, _, _, _ = compute_token_mixed_policy_loss(
+                    old_log_prob=batch_data["old_log_probs"],
+                    log_prob=all_log_prob_tmp,
+                    advantages=batch_data["advantages"],
+                    eos_mask=response,
+                    cliprange=clip_ratio,
+                    cliprange_low=clip_ratio_low,
+                    cliprange_high=clip_ratio_high,
+                    clip_ration_c=clip_ratio_c,
+                    off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
+                    off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
+                    all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
+                    on_policy_reshape=self.config.on_policy_reshape,
+                    on_policy_reshape_weight=self.config.on_policy_reshape_weight,
+                    on_policy_reshape_pow_exp=self.config.on_policy_reshape_pow_exp,
+                    off_policy_reshape=self.config.off_policy_reshape,
+                    off_policy_reshape_weight=self.config.off_policy_reshape_weight,
+                    off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
+                    loss_remove_token_mean=self.config.loss_remove_token_mean,
+                    loss_remove_clip=self.config.loss_remove_clip,
+                )
+            loss_scalar.backward()  # 在 dp_no_sync=False 下，这里会做 reduce-scatter，得到“分片梯度”
+
+        params_named = [(n, p) for n, p in self.actor_module.named_parameters() if p.requires_grad]
+        names, params = zip(*params_named) if params_named else ([], [])
+
+        # 直接返回 grads（不落盘）
+        if return_grads and not save_dir:
+            grads = []
+            for p in params:
+                g = p.grad
+                if g is None:
+                    grads.append(None)
+                else:
+                    # 分片梯度体量较小，可选：直接搬到 CPU 再返回
+                    grads.append(g.detach().to("cpu", dtype=save_cpu_dtype))
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            return grads
+
+        # ====== 落盘模式 ======
+        if save_dir:
+            # 组织目录：{save_dir}/step_{global_step}/{which}/rank_{rank}
+            rank = torch.distributed.get_rank() if (
+                        torch.distributed.is_available() and torch.distributed.is_initialized()) else 0
+            world_size = torch.distributed.get_world_size() if (
+                        torch.distributed.is_available() and torch.distributed.is_initialized()) else 1
+            step = int(getattr(self, "global_step", 0))
+            root = Path(save_dir) / f"step_{step:07d}" / which / f"rank_{rank:03d}"
+            print(f"[MixedActor] 落盘目录：{root}")
+            root.mkdir(parents=True, exist_ok=True)
+
+            manifest = {
+                "which": which,
+                "step": step,
+                "rank": rank,
+                "world_size": world_size,
+                "dtype": str(save_cpu_dtype).replace("torch.", ""),
+                "dp_no_sync": bool(dp_no_sync),
+                "timestamp": int(time.time()),
+                "params": [],  # 每个条目包含 name / file / shape / numel
+            }
+
+            # 可选：把优化器的 v（exp_avg_sq / max_exp_avg_sq）也一起保存（用于离线预条件余弦）
+            def _get_v_state(p):
+                if not save_optimizer_state:
+                    return None
+                st = self.actor_optimizer.state.get(p, None)
+                if not st:
+                    return None
+                return st.get("max_exp_avg_sq", None) or st.get("exp_avg_sq", None)
+
+            # 流式拷贝并保存
+            for idx, (name, p) in enumerate(params_named):
+                g = p.grad
+                if g is None:
+                    continue
+                # 搬到 CPU（分片梯度 -> 体量较小）
+                g_cpu = g.detach().to("cpu", dtype=save_cpu_dtype, non_blocking=False).contiguous()
+
+                safe = _sanitize_name(name)
+                if per_param_files:
+                    # 每参数单独一个 .pt
+                    grad_path = root / f"param_{idx:05d}__{safe}.pt"
+                    torch.save(g_cpu, grad_path)
+                    v_path = None
+                    if save_optimizer_state:
+                        v = _get_v_state(p)
+                        if v is not None:
+                            v_cpu = v.detach().to("cpu", dtype=torch.float32, non_blocking=False).contiguous()
+                            v_path = root / f"param_{idx:05d}__{safe}__v.pt"
+                            torch.save(v_cpu, v_path)
+                    manifest["params"].append({
+                        "idx": idx,
+                        "name": name,
+                        "file": grad_path.name,
+                        "v_file": (v_path.name if v_path else None),
+                        "shape": list(g_cpu.shape),
+                        "numel": int(g_cpu.numel()),
+                    })
+                else:
+                    # 一个 rank 一个大文件（不推荐，难以部分恢复）
+                    # 这里就跳过；你也可以拼到一个 dict 里再 save
+                    pass
+
+                # 立刻释放 GPU 端 grad（以免后续显存峰值）
+                p.grad = None
+
+            # 写 manifest
+            (root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+
+            # 清理
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            return manifest
+
+        # 兜底：既不返回也不保存
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        return None
+
+    def analyze_grads(self, grads_sft, grads_pg, dp_group=None):
+        names = [n for n, p in self.actor_module.named_parameters() if p.requires_grad]
+        params = [p for _, p in self.actor_module.named_parameters() if p.requires_grad]
+
+        # 选择一个 GPU 设备用于 all_reduce（小向量）
+        device0 = next(self.actor_module.parameters()).device
+
+        # eps map
+        param_eps = {}
+        for g in self.actor_optimizer.param_groups:
+            e = g.get("eps", 1e-8)
+            for p in g["params"]:
+                param_eps[p] = e
+
+        per_param_rows = []
+        idx_valid = []
+        idx_valid_pre = []
+
+        # 这些列表放 **Python float** 或 CPU float
+        local_dot, local_n1sq, local_n2sq = [], [], []
+        local_dot_pre, local_n1sq_pre, local_n2sq_pre = [], [], []
+
+        with torch.no_grad():
+            for i, (name, p, g1, g2) in enumerate(zip(names, params, grads_sft, grads_pg)):
+                if g1 is None or g2 is None:
+                    per_param_rows.append({
+                        "name": self.pretty_fsdp_flat_name(name),
+                        "cos": None, "angle_deg": None,
+                        "norm_sft": 0.0, "norm_pg": 0.0,
+                        "cos_pre": None, "angle_pre_deg": None,
+                    })
+                    continue
+
+                # g1/g2 都在 CPU（上一个函数就这么返回的）
+                a = g1.view(-1).to(torch.float32)
+                b = g2.view(-1).to(torch.float32)
+                # 本地标量（Python float）
+                local_dot.append(float((a * b).sum().item()))
+                local_n1sq.append(float((a * a).sum().item()))
+                local_n2sq.append(float((b * b).sum().item()))
+                idx_valid.append(i)
+
+                # 预条件（把 v 拉到 CPU，按需逐层处理，内存峰值很低）
+                state = self.actor_optimizer.state.get(p, None)
+                v = None
+                if state:
+                    v = state.get("max_exp_avg_sq", None) or state.get("exp_avg_sq", None)
+                if v is not None:
+                    v_cpu = v.detach().to(device="cpu", dtype=torch.float32)
+                    denom = v_cpu.sqrt().add(param_eps.get(p, 1e-8))
+                    pa = a / denom
+                    pb = b / denom
+                    local_dot_pre.append(float((pa * pb).sum().item()))
+                    local_n1sq_pre.append(float((pa * pa).sum().item()))
+                    local_n2sq_pre.append(float((pb * pb).sum().item()))
+                    idx_valid_pre.append(i)
+                else:
+                    idx_valid_pre.append(None)
+
+            # ===== 把 CPU 的标量列表打包成 **很小的 CUDA 向量** 再做 all_reduce =====
+            def _reduce_float_list(xs):
+                if len(xs) == 0:
+                    return None
+                t = torch.tensor(xs, device=device0, dtype=torch.float32)
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_group)
+                return t
+
+            dot_g = _reduce_float_list(local_dot)
+            n1sq_g = _reduce_float_list(local_n1sq)
+            n2sq_g = _reduce_float_list(local_n2sq)
+
+            dot_pre_g = _reduce_float_list(local_dot_pre)
+            n1sq_pre_g = _reduce_float_list(local_n1sq_pre)
+            n2sq_pre_g = _reduce_float_list(local_n2sq_pre)
+
+            block_cos_list, precond_block_cos_list = [], []
+            EPS_ = 1e-12
+
+            # 普通版
+            k = 0
+            for row in per_param_rows:
+                if row["cos"] is not None:
+                    n1 = n1sq_g[k].sqrt().clamp_min(EPS_)
+                    n2 = n2sq_g[k].sqrt().clamp_min(EPS_)
+                    cos = (dot_g[k] / (n1 * n2 + EPS_)).clamp(-1 + 1e-6, 1 - 1e-6)
+                    ang = torch.rad2deg(torch.acos(cos))
+                    row["cos"] = float(cos.item())
+                    row["angle_deg"] = float(ang.item())
+                    row["norm_sft"] = float(n1.item())
+                    row["norm_pg"] = float(n2.item())
+                    block_cos_list.append(row["cos"])
+                    k += 1
+
+            # 预条件版
+            k = 0
+            for i, row in enumerate(per_param_rows):
+                if idx_valid_pre[i] is not None and dot_pre_g is not None:
+                    pn1 = n1sq_pre_g[k].sqrt().clamp_min(EPS_)
+                    pn2 = n2sq_pre_g[k].sqrt().clamp_min(EPS_)
+                    cos_p = (dot_pre_g[k] / (pn1 * pn2 + EPS_)).clamp(-1 + 1e-6, 1 - 1e-6)
+                    ang_p = torch.rad2deg(torch.acos(cos_p))
+                    row["cos_pre"] = float(cos_p.item())
+                    row["angle_pre_deg"] = float(ang_p.item())
+                    precond_block_cos_list.append(row["cos_pre"])
+                    k += 1
+
+            # 汇总指标（同你现有逻辑）
+            mini_batch_metrics = {}
+            for r in per_param_rows:
+                layer = r["name"]
+                mini_batch_metrics[f"actor/pp_cos_{layer}"] = r["cos"]
+                mini_batch_metrics[f"actor/pp_ang_{layer}"] = r["angle_deg"]
+                mini_batch_metrics[f"actor/pp_n_sft_{layer}"] = r["norm_sft"]
+                mini_batch_metrics[f"actor/pp_n_pg_{layer}"] = r["norm_pg"]
+                if r["cos_pre"] is not None:
+                    mini_batch_metrics[f"actor/pp_cos_pre_{layer}"] = r["cos_pre"]
+                    mini_batch_metrics[f"actor/pp_ang_pre_{layer}"] = r["angle_pre_deg"]
+
+            def _ang_from_cos(c):
+                if c is None: return None
+                t = torch.tensor(c).clamp(-1 + 1e-6, 1 - 1e-6)
+                return float(torch.rad2deg(torch.acos(t)).item())
+
+            if len(block_cos_list) > 0:
+                gb = float(sum(block_cos_list) / len(block_cos_list))
+                mini_batch_metrics["actor/global_block_cos"] = gb
+                mini_batch_metrics["actor/global_block_ang_deg"] = _ang_from_cos(gb)
+            else:
+                mini_batch_metrics["actor/global_block_cos"] = None
+                mini_batch_metrics["actor/global_block_ang_deg"] = None
+
+            if len(precond_block_cos_list) > 0:
+                gbp = float(sum(precond_block_cos_list) / len(precond_block_cos_list))
+                mini_batch_metrics["actor/global_block_cos_precond"] = gbp
+                mini_batch_metrics["actor/global_block_ang_precond_deg"] = _ang_from_cos(gbp)
+            else:
+                mini_batch_metrics["actor/global_block_cos_precond"] = None
+                mini_batch_metrics["actor/global_block_ang_precond_deg"] = None
+
+        # 彻底释放 CPU 端大块内存
+        del grads_sft, grads_pg
+        return mini_batch_metrics
+
+    def pretty_fsdp_flat_name(self, n: str) -> str:
+        # n 是你现在拿到的参数名
+        if n.endswith("._flat_param"):
+            if ".model.layers." in n:
+                # 逐层
+                idx = n.split(".model.layers.")[1].split(".")[0]
+                return f"block_{idx}"
+            else:
+                # 顶层未被细分的那部分
+                return "top_level_misc"  # 可能包含 embeddings/final_norm/lm_head 等
+        return n
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -451,42 +821,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                 mini_batch_metrics = {}
 
                 if self.config.calculate_sft_loss and self.config.calculate_rl_loss and self.config.need_analyze_gradients:
-                    def _grab_grads_recompute(which: str, batch_data: TensorDict, response: torch.Tensor,):
-                        self.actor_optimizer.zero_grad(set_to_none=True)
-                        _, all_log_prob_tmp = self._forward_micro_batch(
-                            micro_batch=batch_data, temperature=temperature
-                        )
-                        if which == "sft":
-                            loss_scalar = compute_sft_loss(all_log_prob_tmp, response)
-                        else:  # "pg"
-                            loss_scalar, _, _, _ = compute_token_mixed_policy_loss(
-                                old_log_prob=batch_data["old_log_probs"],
-                                log_prob=all_log_prob_tmp,
-                                advantages=batch_data["advantages"],
-                                eos_mask=response,
-                                cliprange=clip_ratio,
-                                cliprange_low=clip_ratio_low,
-                                cliprange_high=clip_ratio_high,
-                                clip_ration_c=clip_ratio_c,
-                                off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
-                                off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
-                                all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
-                                on_policy_reshape=self.config.on_policy_reshape,
-                                on_policy_reshape_weight=self.config.on_policy_reshape_weight,
-                                on_policy_reshape_pow_exp=self.config.on_policy_reshape_pow_exp,
-                                off_policy_reshape=self.config.off_policy_reshape,
-                                off_policy_reshape_weight=self.config.off_policy_reshape_weight,
-                                off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
-                                loss_remove_token_mean=self.config.loss_remove_token_mean,
-                                loss_remove_clip=self.config.loss_remove_clip,
-                            )
-                        loss_scalar.backward()
-                        # 3) 取出梯度并清理
-                        params = [p for p in self.actor_module.parameters() if p.requires_grad]
-                        grads = [None if p.grad is None else p.grad.detach().clone() for p in params]
-                        self.actor_optimizer.zero_grad(set_to_none=True)
-                        return grads
-
+                    out_dir = self.config.get("analyze_dump_dir", "./grad_dumps")
                     sft_batch_data = micro_batches[0].clone()
                     sft_batch_data = TensorDict(
                         {'input_ids': sft_batch_data["tgt_input_ids"],
@@ -495,8 +830,9 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                          'responses': sft_batch_data["tgt_responses"], }
                     )
                     sft_batch_data['response_mask'] = sft_batch_data['attention_mask'][:, prompt_length:]
-                    grads_sft = _grab_grads_recompute("sft", sft_batch_data, sft_batch_data['response_mask']) \
-                        if self.config.calculate_sft_loss else None
+                    sft_manifest = self._grab_grads_recompute("sft", sft_batch_data, sft_batch_data['response_mask'],
+                            temperature=temperature, dp_no_sync=False, return_grads=False, save_dir=out_dir,
+                            save_cpu_dtype=torch.float16, per_param_files=True, save_optimizer_state=False)
 
                     rl_batch_data = micro_batches[0].clone()
                     rl_batch_data = TensorDict(
@@ -508,48 +844,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                          'advantages': rl_batch_data["advantages"], }
                     )
                     rl_batch_data['response_mask'] = rl_batch_data['attention_mask'][:, prompt_length:]
-                    grads_pg = _grab_grads_recompute("pg", rl_batch_data, rl_batch_data['response_mask'])\
-                        if self.config.calculate_rl_loss else None
+                    pg_manifest = self._grab_grads_recompute("pg", rl_batch_data, rl_batch_data['response_mask'],
+                                temperature, dp_no_sync=False, clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high,
+                                clip_ratio_low=clip_ratio_low, clip_ratio_c=clip_ratio_c, return_grads=False,
+                                save_dir=out_dir, save_cpu_dtype=torch.float16, per_param_files=True,
+                                save_optimizer_state=False)
 
-                    param_names = [n for n, p in self.actor_module.named_parameters() if p.requires_grad]
-                    # 注意：参数遍历顺序与 .parameters() 一致；在 _grab_grads_recompute 里按 .parameters() 采集的 grads_* 与这里顺序是对齐的
-                    # print('param_names: ', param_names)
-                    per_param_rows = []
-                    for name, g1, g2 in zip(param_names, grads_sft, grads_pg):
-                        if g1 is None or g2 is None:
-                            per_param_rows.append({
-                                "name": name, "cos": None, "angle_deg": None,
-                                "norm_sft": 0.0 if g1 is None else _to_f32(g1).norm().item(),
-                                "norm_pg": 0.0 if g2 is None else _to_f32(g2).norm().item(),
-                            })
-                            continue
-                        a = _to_f32(g1).reshape(-1)
-                        b = _to_f32(g2).reshape(-1)
-                        dot = (a * b).sum()
-                        n1 = a.norm().clamp_min(EPS)
-                        n2 = b.norm().clamp_min(EPS)
-                        cos = (dot / (n1 * n2)).clamp(-1 + 1e-6, 1 - 1e-6)
-                        angle = torch.rad2deg(torch.acos(cos))
-
-                        per_param_rows.append({
-                            "name": name,
-                            "cos": cos.item(),
-                            "angle_deg": angle.item(),
-                            "norm_sft": n1.item(),
-                            "norm_pg": n2.item(),
-                        })
-
-                    for i, r in enumerate(per_param_rows):
-                        mini_batch_metrics[f"actor/pp_cos_{i}"] = r["cos"]
-                        mini_batch_metrics[f"actor/pp_ang_{i}"] = r["angle_deg"]
-                        mini_batch_metrics[f"actor/pp_n_sft_{i}"] = r["norm_sft"]
-                        mini_batch_metrics[f"actor/pp_n_pg_{i}"] = r["norm_pg"]
-                        # 也可把名字打印到日志
-                        print(f"[Param {i}] {r['name']} cos={r['cos']:.4f} angle={r['angle_deg']:.1f}° "
-                              f"||sft||={r['norm_sft']:.3e} ||pg||={r['norm_pg']:.3e}")
-
-                    del grads_sft, grads_pg
-                    torch.cuda.empty_cache()
+                    # mini_batch_metrics = self.analyze_grads(grads_sft, grads_pg)
+                    del sft_batch_data, rl_batch_data
 
                 for index, data in enumerate(micro_batches):
                     micro_batch_metrics = {}
@@ -601,7 +903,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     )
 
                     if self.config.calculate_sft_loss:
-                        sft_loss = compute_sft_loss(all_log_prob[~policy_mask], response_mask[~policy_mask]) * self.config.sft_loss_coef
+                        sft_loss = compute_sft_loss(all_log_prob[~policy_mask], response_mask[~policy_mask])
                         # print('sft loss: ', sft_loss)
                     else:
                         sft_loss = torch.tensor(0.0, device=get_device_id())

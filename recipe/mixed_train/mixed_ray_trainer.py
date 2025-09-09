@@ -18,7 +18,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
-    reduce_metrics, process_validation_metrics,
+    process_validation_metrics,
 )
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
@@ -27,6 +27,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 
 
@@ -203,22 +204,6 @@ class RayMixedTrainer(RayPPOTrainer):
                         
                         timing_raw.update(gen_batch_mixed_output.meta_info["timing"])
                         gen_batch_mixed_output.meta_info.pop("timing", None)
-
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with marked_timer("gen_max", timing_raw, "red"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-
-                            new_batch = new_batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(new_batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            new_batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            new_batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
 
                     new_batch.non_tensor_batch["uid"] = np.array(
                         [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
@@ -588,6 +573,18 @@ class RayMixedTrainer(RayPPOTrainer):
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        if 'acc' in reward_extra_infos_dict:
+            reward_list_length = len(reward_extra_infos_dict["acc"])
+            print(reward_extra_infos_dict['acc'])
+            rewards_total = 0.0
+            for item in reward_extra_infos_dict["acc"]:
+                if item:
+                    rewards_total += 1.0
+            print(f'rewards total {rewards_total}')
+            metric_dict["val-aux/reward/mean"] = rewards_total / reward_list_length
+        else:
+            print('not contains acc')
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
