@@ -782,9 +782,8 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         # print('ppo mini batch: ', self.config.ppo_mini_batch_size)
-        # print('length of mini batch: ', len(dataloader))
         metrics = {}
-        print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
+        # print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
