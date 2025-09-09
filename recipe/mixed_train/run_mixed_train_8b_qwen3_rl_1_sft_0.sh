@@ -41,28 +41,11 @@ n_gpus_per_node=${devices_num}
 if [ "$devices_num" -lt 2 ]; then
     tensor_model_parallel_size=1
 else
-    tensor_model_parallel_size=2
+    tensor_model_parallel_size=4
 fi
 sp_size=1
 echo "tensor_model_parallel_size: ${tensor_model_parallel_size}"
 echo "sp_size: ${sp_size}"
-
-######
-#export GLOO_SOCKET_IFNAME="ens18f0"
-#export NCCL_SOCKET_IFNAME="ens18f0"
-
-# 在GPU集群上训练时
-# unset ROCR_VISIBLE_DEVICES
-# unset HIP_VISIBLE_DEVICES
-# export CUDA_VISIBLE_DEVICES="0,1"
-
-### ray
-# ray stop --force
-
-# CUDA_VISIBLE_DEVICES=${devices} ray start \
-#     --head \
-#     --num-gpus ${devices_num} \
-#     --ray-debugger-external
 
 #### 不改的目录
 log_path=$HOME/jyh/verl/log
@@ -76,7 +59,6 @@ set -xeuo pipefail
 project_name=mixed_train
 experiment_name=pure_rl_Qwen3-8B
 
-adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -87,9 +69,9 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=1024
-max_response_length=$((1024 * 8))
+max_response_length=8192
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 6))
+overlong_buffer_len=8192
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
@@ -109,13 +91,12 @@ ppo_mini_bsz=64
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
 # Paths
-model_path=$HOME/jyh/llm_models/Qwen/Qwen2.5-7B-Instruct
+model_path=$HOME/jyh/llm_models/Qwen/Qwen2.5-Math-7B-16k-think
 default_local_dir=${output_path}/${project_name}/${experiment_name}
 log_filename=${log_path}/${project_name}/${experiment_name}.log
 mkdir -p ${log_path}/${project_name}
 train_files=${data_path}/openr1.parquet
 test_files=${data_path}/valid.parquet
-
 
 # 算法
 temperature=1.0
@@ -142,7 +123,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     data.train_batch_size=${train_prompt_bsz} \
     data.val_batch_size=${val_batch_size} \
     data.validation_shuffle=True \
-    algorithm.adv_estimator=${adv_estimator} \
+    algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.norm_adv_by_std_in_grpo=False \
