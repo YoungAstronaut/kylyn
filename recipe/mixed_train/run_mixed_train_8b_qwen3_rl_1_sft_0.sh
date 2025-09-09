@@ -101,7 +101,7 @@ train_prompt_bsz=64  # train_batch_size
 val_batch_size=256
 gen_prompt_bsz=64
 n_resp_per_prompt=8
-train_prompt_mini_bsz=16
+ppo_mini_bsz=64
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -172,7 +172,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
     actor_rollout_ref.actor.entropy_coeff=0 \
