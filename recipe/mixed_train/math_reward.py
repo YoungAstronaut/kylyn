@@ -98,11 +98,10 @@ def last_boxed_only_string(string):
         i += 1
     
     if right_brace_idx == None:
-        retval = None
+        return ''
     else:
         retval = string[idx:right_brace_idx + 1]
-    
-    return retval.replace('\\boxed{', '')[:-1]
+        return retval.replace('\\boxed{', '')[:-1]
 
 class RuleBasedRewardManager():
     def __init__(
