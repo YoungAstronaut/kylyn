@@ -129,3 +129,9 @@ logs
 log
 outputs
 .history
+
+# grad
+grad_dumps
+
+# .whl 文件
+*.whl
