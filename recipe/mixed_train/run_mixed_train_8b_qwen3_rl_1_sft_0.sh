@@ -41,7 +41,7 @@ n_gpus_per_node=${devices_num}
 if [ "$devices_num" -lt 2 ]; then
     tensor_model_parallel_size=1
 else
-    tensor_model_parallel_size=4
+    tensor_model_parallel_size=2
 fi
 sp_size=1
 echo "tensor_model_parallel_size: ${tensor_model_parallel_size}"
@@ -78,10 +78,8 @@ loss_agg_mode="token-mean"
 
 enable_filter_groups=False
 filter_groups_metric=acc
-max_num_gen_batches=10
 train_prompt_bsz=64  # train_batch_size
-val_batch_size=256
-gen_prompt_bsz=64
+gen_prompt_bsz=128
 n_resp_per_prompt=8
 ppo_mini_bsz=64
 
@@ -105,7 +103,7 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 
 # Performance 相关超参
 use_dynamic_bsz=True
-infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
+infer_ppo_max_token_len=16384
 offload=True
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -121,7 +119,6 @@ python3 -m recipe.mixed_train.main_mixed_train \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.max_target_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
-    data.val_batch_size=${val_batch_size} \
     data.validation_shuffle=True \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
@@ -186,8 +183,10 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.nnodes="${nnodes}" \
     trainer.val_before_train=False \
-    trainer.test_freq=1 \
-    trainer.save_freq=-1 \
+    trainer.test_freq=5 \
+    trainer.save_freq=20 \
     trainer.total_epochs=1 \
+    trainer.need_analyze_gradients=True \
+    trainer.save_gradients_freq=30 \
     trainer.default_local_dir="${default_local_dir}" \
     trainer.resume_mode=auto 2>&1 | tee ${log_filename}

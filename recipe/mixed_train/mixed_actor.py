@@ -452,6 +452,8 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             save_cpu_dtype: torch.dtype = torch.float16,
             per_param_files: bool = True,
             save_optimizer_state: bool = False,  # 如需离线做预条件余弦，建议 True
+            step: int = 0,
+            mini_batch_idx: int = 0
     ):
         """
         计算一次 SFT/PG 的纯净梯度（与优化器状态一致的“分片梯度”），并可选直接落盘。
@@ -520,8 +522,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         torch.distributed.is_available() and torch.distributed.is_initialized()) else 0
             world_size = torch.distributed.get_world_size() if (
                         torch.distributed.is_available() and torch.distributed.is_initialized()) else 1
-            step = int(getattr(self, "global_step", 0))
-            root = Path(save_dir) / f"step_{step:07d}" / which / f"rank_{rank:03d}"
+            root = Path(save_dir) / f"step_{step:03d}batch_idx_{mini_batch_idx:03d}" / which / f"rank_{rank:03d}"
             print(f"[MixedActor] 落盘目录：{root}")
             root.mkdir(parents=True, exist_ok=True)
 
@@ -750,6 +751,10 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        need_analyze_gradients = data.meta_info.get('need_analyze_gradients', False)
+        print(f'need analyze gradients: {need_analyze_gradients}')
+        step_index = data.meta_info.get('step_index', 0)
+        print(f'step index: {step_index}')
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -786,6 +791,53 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         # print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
+                # print(f'data: {data}')
+                clip_ratio = self.config.clip_ratio
+                clip_ratio_low = (
+                    self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                )
+                clip_ratio_high = (
+                    self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                )
+                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+
+                responses_length = data[0]["responses"].shape[-1]
+                prompt_length = data[0]["input_ids"].shape[-1] - responses_length
+
+                if need_analyze_gradients:
+                    out_dir = self.config.get("analyze_dump_dir", "./grad_dumps")
+                    sft_batch_data = data[0:1].clone()
+                    sft_batch_data = TensorDict(
+                        {'input_ids': sft_batch_data["tgt_input_ids"],
+                         'attention_mask': sft_batch_data["tgt_attention_mask"],
+                         'position_ids': sft_batch_data["position_ids"],
+                         'responses': sft_batch_data["tgt_responses"], }
+                    )
+                    sft_batch_data['response_mask'] = sft_batch_data['attention_mask'][:, prompt_length:]
+                    sft_manifest = self._grab_grads_recompute("sft", sft_batch_data, sft_batch_data['response_mask'],
+                            temperature=temperature, dp_no_sync=False, return_grads=False, save_dir=out_dir,
+                            save_cpu_dtype=torch.float16, per_param_files=True, save_optimizer_state=False,
+                            step=step_index, mini_batch_idx=batch_idx)
+
+                    rl_batch_data = data[0:1].clone()
+                    rl_batch_data = TensorDict(
+                        {'input_ids': rl_batch_data["input_ids"],
+                         'attention_mask': rl_batch_data["attention_mask"],
+                         'position_ids': rl_batch_data["position_ids"],
+                         'responses': rl_batch_data["responses"],
+                         'old_log_probs': rl_batch_data["old_log_probs"],
+                         'advantages': rl_batch_data["advantages"], }
+                    )
+                    rl_batch_data['response_mask'] = rl_batch_data['attention_mask'][:, prompt_length:]
+                    pg_manifest = self._grab_grads_recompute("pg", rl_batch_data, rl_batch_data['response_mask'],
+                                temperature, dp_no_sync=False, clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high,
+                                clip_ratio_low=clip_ratio_low, clip_ratio_c=clip_ratio_c, return_grads=False,
+                                save_dir=out_dir, save_cpu_dtype=torch.float16, per_param_files=True,
+                                save_optimizer_state=False, step=step_index, mini_batch_idx=batch_idx)
+
+                    # mini_batch_metrics = self.analyze_grads(grads_sft, grads_pg)
+                    del sft_batch_data, rl_batch_data
+
                 # split batch into micro_batches
                 mini_batch = data
                 # print('mini batch: ', mini_batch)
@@ -804,53 +856,9 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                responses_length = micro_batches[0]["responses"].shape[1]
-                prompt_length = micro_batches[0]["input_ids"].shape[1] - responses_length
-                clip_ratio = self.config.clip_ratio
-                clip_ratio_low = (
-                    self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                )
-                clip_ratio_high = (
-                    self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                )
-                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-
                 micro_batches = [convert_data(batch) for batch in micro_batches]
 
                 mini_batch_metrics = {}
-
-                if self.config.calculate_sft_loss and self.config.calculate_rl_loss and self.config.need_analyze_gradients:
-                    out_dir = self.config.get("analyze_dump_dir", "./grad_dumps")
-                    sft_batch_data = micro_batches[0].clone()
-                    sft_batch_data = TensorDict(
-                        {'input_ids': sft_batch_data["tgt_input_ids"],
-                         'attention_mask': sft_batch_data["tgt_attention_mask"],
-                         'position_ids': sft_batch_data["position_ids"],
-                         'responses': sft_batch_data["tgt_responses"], }
-                    )
-                    sft_batch_data['response_mask'] = sft_batch_data['attention_mask'][:, prompt_length:]
-                    sft_manifest = self._grab_grads_recompute("sft", sft_batch_data, sft_batch_data['response_mask'],
-                            temperature=temperature, dp_no_sync=False, return_grads=False, save_dir=out_dir,
-                            save_cpu_dtype=torch.float16, per_param_files=True, save_optimizer_state=False)
-
-                    rl_batch_data = micro_batches[0].clone()
-                    rl_batch_data = TensorDict(
-                        {'input_ids': rl_batch_data["input_ids"],
-                         'attention_mask': rl_batch_data["attention_mask"],
-                         'position_ids': rl_batch_data["position_ids"],
-                         'responses': rl_batch_data["responses"],
-                         'old_log_probs': rl_batch_data["old_log_probs"],
-                         'advantages': rl_batch_data["advantages"], }
-                    )
-                    rl_batch_data['response_mask'] = rl_batch_data['attention_mask'][:, prompt_length:]
-                    pg_manifest = self._grab_grads_recompute("pg", rl_batch_data, rl_batch_data['response_mask'],
-                                temperature, dp_no_sync=False, clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high,
-                                clip_ratio_low=clip_ratio_low, clip_ratio_c=clip_ratio_c, return_grads=False,
-                                save_dir=out_dir, save_cpu_dtype=torch.float16, per_param_files=True,
-                                save_optimizer_state=False)
-
-                    # mini_batch_metrics = self.analyze_grads(grads_sft, grads_pg)
-                    del sft_batch_data, rl_batch_data
 
                 for index, data in enumerate(micro_batches):
                     micro_batch_metrics = {}

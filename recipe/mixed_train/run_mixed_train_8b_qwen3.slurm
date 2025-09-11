@@ -4,6 +4,7 @@
 #SBATCH -e job-%j.err
 #SBATCH -p GPU-8A100
 #SBATCH -N 1
+#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
 #SBATCH --qos=gpu_8a100
 
@@ -62,13 +63,12 @@ echo "GPU Num Per Node $SLURM_GPUS_PER_NODE"
 echo "Node Num $SLURM_JOB_NUM_NODES"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate jyh-verl
+conda activate verl
 
 unset ROCR_VISIBLE_DEVICES
-unset HIP_VISIBLE_DEVICES
 export WANDB_MODE=offline 
 
-CUDA_VISBLE_DEVICES=0,1,2,3 ray start --head --num-gpus 4
+ray start --head
 
 sleep 30
 

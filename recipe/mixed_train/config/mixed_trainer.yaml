@@ -34,7 +34,6 @@ algorithm:
 
 actor_rollout_ref:
   rollout:
-    logprobs: 20
     calculate_log_probs: False
     n_off_policy: 1
   actor:
@@ -58,7 +57,8 @@ actor_rollout_ref:
     loss_remove_clip: False
     sft_loss_coef: 0.1 # 仅在calculate_sft_loss为True时生效
     calculate_rl_loss: True
-    need_analyze_gradients: False
 
 trainer:
   project_name: verl-dapo
+  need_analyze_gradients: False
+  save_gradients_freq: 10

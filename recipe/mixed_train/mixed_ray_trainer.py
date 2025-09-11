@@ -4,7 +4,6 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 import uuid
 from collections import defaultdict
-from copy import deepcopy
 from pprint import pprint
 
 import numpy as np
@@ -18,10 +17,8 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
-    process_validation_metrics,
 )
 from verl.trainer.ppo.ray_trainer import (
-    AdvantageEstimator,
     RayPPOTrainer,
     apply_kl_penalty,
     compute_advantage,
@@ -113,7 +110,7 @@ class RayMixedTrainer(RayPPOTrainer):
                     interleave=True
                 )
 
-                is_last_step = self.global_steps >= 50
+                is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
@@ -371,7 +368,13 @@ class RayMixedTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            print('batch before update actor ', batch.batch)
+                            # print('batch before update actor ', batch.batch)
+                            # print(f' need_analyze_gradients: {self.config.trainer.need_analyze_gradients}')
+                            # print(f' save  gradients freq: {self.config.trainer.save_gradients_freq}')
+                            if self.config.trainer.get('need_analyze_gradients', False) \
+                                and self.global_steps % self.config.trainer.get('save_gradients_freq', 10) == 0:
+                                batch.meta_info['need_analyze_gradients'] = True
+                                batch.meta_info['step_index'] = self.global_steps
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -452,7 +455,7 @@ class RayMixedTrainer(RayPPOTrainer):
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
 
-            n_val_samples = self.config.actor_rollout_ref.rollout.n_val
+            n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
             test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
             test_gen_batch.meta_info = {
@@ -465,7 +468,7 @@ class RayMixedTrainer(RayPPOTrainer):
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
+            test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_kwargs.temperature
             test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -490,8 +493,12 @@ class RayMixedTrainer(RayPPOTrainer):
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
 
-        metric_dict = {}
+        overall_score = np.mean(reward_tensor.numpy()) / reward_tensor.shape[0]
+        print(f'overall average score: {overall_score:.4f}')
+        metric_dict = {f'val/overall_score': overall_score,
+                       f'val/overall_correct': np.mean(reward_tensor.numpy()),}
         for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            average_score = np.mean(rewards)
+            metric_dict[f'val/test_score/{data_source}'] = average_score
 
         return metric_dict
