@@ -60,5 +60,6 @@ actor_rollout_ref:
 
 trainer:
   project_name: verl-dapo
-  need_analyze_gradients: False
-  save_gradients_freq: 10
+  need_analyze_sft_grads: False
+  need_analyze_off_grads: False
+  analyze_gradients_freq: 10

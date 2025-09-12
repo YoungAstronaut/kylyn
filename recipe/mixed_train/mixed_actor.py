@@ -25,7 +25,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-from torch import distributed as dist
+from torch import distributed as dist, Tensor
 from tensordict import TensorDict
 
 import verl.utils.torch_functional as verl_F
@@ -33,7 +33,8 @@ from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import ceildiv, get_seqlen_balanced_partitions, roundup_divisible
+from verl.utils.seqlen_balancing import ceildiv, get_seqlen_balanced_partitions, roundup_divisible, \
+    rearrange_micro_batches
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
 # if is_cuda_available:
@@ -78,6 +79,23 @@ def _safe_angle_from_cos(cos_val: float):
     t = t.clamp(-1 + 1e-6, 1 - 1e-6)
     return torch.rad2deg(torch.acos(t)).item()
 
+def split_on_policy_batch(
+        batch: TensorDict
+) -> (TensorDict, TensorDict):
+    batch_size = batch.batch_size[0]
+    on_policy_partitions = []
+    off_policy_partitions = []
+    for i in range(batch_size):
+        valid_mask = batch['on_policy_mask'][i:i + 1].sum()
+        assert valid_mask == 0 or valid_mask == batch[i:i+1]['on_policy_mask'].shape[-1], \
+            f'the on policy mask is not all zeros neither all ones. valid mask: {valid_mask}'
+        if valid_mask > 0:
+            on_policy_partitions.append(batch[i:i + 1])
+        else:
+            off_policy_partitions.append(batch[i:i + 1])
+    return torch.cat(on_policy_partitions) if len(on_policy_partitions) > 0 else None, \
+        torch.cat(off_policy_partitions) if len(off_policy_partitions) > 0 else None
+
 def analyze_gradients(sft_grads, rl_grads):
     results = {}
     for name in sft_grads.keys():
@@ -120,165 +138,175 @@ def compute_sft_loss(log_prob, mask):
     # print(f"SFT有效token数量: {valid_tokens}")
     return -torch.sum(log_prob * mask) / torch.sum(mask)
 
+def shape_on_policy(shape_strategy: str,
+                    old_log_prob: Tensor,
+                    log_prob: Tensor,
+                    policy_reshape_pow_exp: float = 0.5,
+                    policy_reshape_weight: float = 1.0,
+                    eps: float = 1e-8):
+    # 基础量：log 比率
+    log_ratio = log_prob - old_log_prob
+    # 防溢出/下溢
+    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+
+    # 返回 (ratio_like, is_multiplicative_ratio)
+    if shape_strategy == "no_reshape":
+        ratio = torch.exp(log_ratio)
+        return ratio, True
+    elif shape_strategy == "logp":
+        # 加性整形（不是乘性 ratio）
+        ratio = policy_reshape_weight * log_ratio
+        return ratio, False
+    elif shape_strategy == "p_logp":
+        r = torch.exp(log_ratio)
+        ratio = r + policy_reshape_weight * log_ratio
+        return ratio, True  # 仍然有 ratio 主体
+    elif shape_strategy == "square_root":
+        ratio = torch.sqrt(torch.exp(log_ratio))
+        return ratio, True
+    elif shape_strategy == "pow":
+        ratio = torch.pow(torch.exp(log_ratio), policy_reshape_pow_exp)
+        return ratio, True
+    elif shape_strategy in {"p_div_p_0.1", "p_div_p_0.5", "p_div_p_0.3"}:
+        c = float(shape_strategy.split("_")[-1])
+        p = torch.exp(log_prob)            # (0, 1]
+        p_old = torch.exp(old_log_prob)    # (0, 1]
+        f = p / (p + c)
+        f_old = p_old / (p_old + c)
+        ratio = (f + eps) / (f_old + eps)  # 防 0/0
+        return ratio, True
+    else:
+        raise ValueError(f"Invalid on_policy_reshape: {shape_strategy}")
+
+def shape_off_policy(shape_strategy: str,
+                     old_log_prob: Tensor,
+                     log_prob: Tensor,
+                     policy_reshape_weight: float = 1.0,
+                     policy_reshape_pow_exp: float = 0.5,
+                     eps: float = 1e-8):
+    # 这里不是严格 ratio，更多是“提升该 token 概率”的系数
+    off_ratio = torch.exp(log_prob)  # (0, 1]
+    if shape_strategy == "no_reshape":
+        pass
+    elif shape_strategy == "logp":
+        off_ratio = policy_reshape_weight * log_prob
+    elif shape_strategy == "p_logp":
+        off_ratio = policy_reshape_weight * log_prob + off_ratio
+    elif shape_strategy == "square_root":
+        off_ratio = torch.sqrt(off_ratio)
+    elif shape_strategy == "p_div_p_0.1":
+        off_ratio = off_ratio / (off_ratio + 0.1)
+    elif shape_strategy == "p_div_p_0.5":
+        off_ratio = off_ratio / (off_ratio + 0.5)
+    elif shape_strategy == "p_div_p_0.3":
+        off_ratio = off_ratio / (off_ratio + 0.3)
+    elif shape_strategy == "pow":
+        off_ratio = torch.pow(off_ratio, policy_reshape_pow_exp)
+    else:
+        raise ValueError(f"Invalid off_policy_reshape: {shape_strategy}")
+    return off_ratio  # ← 必须返回
+
 def compute_token_mixed_policy_loss(
-    old_log_prob, 
-    log_prob, 
-    advantages, 
-    eos_mask, 
-    cliprange, 
+    old_log_prob,
+    log_prob,
+    advantages,
+    eos_mask,
     cliprange_low,
     cliprange_high,
-    clip_ration_c,
-    off_max_clip=None, 
-    off_min_clip=None,
-    all_max_clip=None, 
-    on_policy_reshape="no_reshape", 
+    on_policy_reshape="no_reshape",
     on_policy_reshape_weight=1.0,
     on_policy_reshape_pow_exp=0.5,
-    off_policy_reshape="no_reshape", 
-    off_policy_reshape_weight=1.0, 
+    on_policy_mask=None,
+    off_policy_reshape="no_reshape",
+    off_policy_reshape_weight=1.0,
     off_policy_reshape_pow_exp=0.5,
+    off_max_clip=None,
+    off_min_clip=None,
+    all_max_clip=None,
     loss_remove_token_mean=False,
     loss_remove_clip=False,
 ):
-    # TODO: 补充这一段的注释，可以参考默认的PPOActor
-    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+    # 1) 形状与基本检查
+    assert log_prob.shape == old_log_prob.shape, f'log_prob shape {log_prob.shape} != old_log_prob shape {old_log_prob.shape}'
+    assert log_prob.shape == advantages.shape,   f'log_prob shape {log_prob.shape} != advantages shape {advantages.shape}'
+    assert log_prob.shape == eos_mask.shape,     f'log_prob shape {log_prob.shape} != eos_mask shape {eos_mask.shape}'
 
-    Args:
-        old_log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        eos_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
+    # 统一设备/类型的零
+    def _zero_like_scalar(x: Tensor):
+        return x.new_zeros(())
 
-    Returns:
-        pg_loss: `a scalar torch.Tensor`
-            policy gradient loss computed via PPO
-        pg_clipfrac: (float)
-            a float number indicating the fraction of policy gradient loss being clipped
+    # 把 on_policy_mask 处理成 bool mask
+    has_on_mask = on_policy_mask is not None
+    if has_on_mask:
+        assert on_policy_mask.shape == eos_mask.shape, "on_policy_mask shape mismatch"
+        if on_policy_mask.dtype != torch.bool:
+            on_policy_mask = on_policy_mask.bool()
+        on_mask = on_policy_mask & eos_mask.bool()
+        off_mask = (~on_policy_mask) & eos_mask.bool()
+    else:
+        on_mask = eos_mask.bool()
+        off_mask = None  # 没 off-policy
 
-    """
-    # off-policy loss
-    # compute off-policy probability
-    assert log_prob.shape == old_log_prob.shape, f'log_prob shape {log_prob.shape} does not match old_log_prob shape {old_log_prob.shape}'
-    assert log_prob.shape == advantages.shape, f'log_prob shape {log_prob.shape} does not match advantages shape {advantages.shape}'
-    assert log_prob.shape == eos_mask.shape, f'log_prob shape {log_prob.shape} does not match eos_mask shape {eos_mask.shape}'
-
+    # 2) 近似 KL（日志用途）：old - new
     negative_approx_kl = log_prob - old_log_prob
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
-    # rl_valid_tokens = torch.sum(eos_mask).item()
-    # print(f"RL有效token数量: {rl_valid_tokens}")
 
-    # TODO: 测试on-policy是否需要shape
-    # if on_policy_reshape == "no_reshape":
-    #     ratio = torch.exp(negative_approx_kl) # [bsz, l]
-    # elif on_policy_reshape == "logp":
-    #     ratio = log_prob - old_log_prob
-    # elif on_policy_reshape == "p_logp":
-    #     ratio = torch.exp(negative_approx_kl) + on_policy_reshape_weight * negative_approx_kl
-    # elif on_policy_reshape == "square_root":
-    #     ratio = torch.exp(negative_approx_kl) # [bsz, l]
-    #     ratio = torch.sqrt(ratio)
-    # elif on_policy_reshape == "pow":
-    #     ratio = torch.exp(negative_approx_kl) # [bsz, l]
-    #     ratio = torch.pow(ratio, on_policy_reshape_pow_exp)
-    # elif on_policy_reshape == "p_div_p_0.1":
-    #     prob = torch.exp(log_prob)
-    #     old_prob = torch.exp(old_log_prob)
-    #     f_prob = prob / (prob + 0.1)
-    #     f_old_prob = old_prob / (old_prob + 0.1)
-    #     ratio = f_prob / f_old_prob
-    # elif on_policy_reshape == "p_div_p_0.5":
-    #     prob = torch.exp(log_prob)
-    #     old_prob = torch.exp(old_log_prob)
-    #     f_prob = prob / (prob + 0.5)
-    #     f_old_prob = old_prob / (old_prob + 0.5)
-    #     ratio = f_prob / f_old_prob
-    # else:
-    #     raise ValueError(f"Invalid on_policy_reshape: {on_policy_reshape}")
-    ratio = torch.exp(negative_approx_kl)
+    # 3) on-policy ratio 与（可选）裁剪
+    ratio, is_multiplicative = shape_on_policy(
+        on_policy_reshape, old_log_prob, log_prob,
+        policy_reshape_pow_exp=on_policy_reshape_pow_exp,
+        policy_reshape_weight=on_policy_reshape_weight
+    )
+
+    if (all_max_clip is not None) and is_multiplicative:
+        ratio = torch.clamp(ratio, max=all_max_clip)
+
     on_pg_losses = -advantages * ratio
 
-    # TODO: 看是否需要clip
-    on_pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange_low, 1.0 + cliprange_high)
-    on_pg_clipfrac = verl_F.masked_mean(torch.gt(on_pg_losses2, on_pg_losses).float(), eos_mask)
-    on_pg_losses = torch.max(on_pg_losses, on_pg_losses2)
-    on_pg_loss = verl_F.masked_mean(on_pg_losses, eos_mask)
-    pg_loss = on_pg_loss
+    if (not loss_remove_clip) and is_multiplicative:
+        ratio_clamped = torch.clamp(ratio, 1.0 - cliprange_low, 1.0 + cliprange_high)
+        on_pg_losses2 = -advantages * ratio_clamped
+        # 注意：clipfrac 统计仅对 on-policy token
+        on_pg_clipfrac = verl_F.masked_mean((on_pg_losses2 > on_pg_losses).float(), on_mask)
+        on_pg_losses = torch.max(on_pg_losses, on_pg_losses2)
+    else:
+        on_pg_clipfrac = _zero_like_scalar(log_prob)
 
-    # compute off-policy loss
-    # TODO: 研究一下off-policy是否需要shape和不同strategy的作用
-    # off_ratio = torch.exp(log_prob) # [bsz, l]
-    # if off_policy_reshape == "no_reshape":
-    #     pass
-    # elif off_policy_reshape == "logp":
-    #     off_ratio = log_prob * off_policy_reshape_weight
-    # elif off_policy_reshape == "p_logp":
-    #     off_ratio = log_prob * off_policy_reshape_weight + off_ratio
-    # elif off_policy_reshape == "square_root":
-    #     off_ratio = torch.sqrt(off_ratio)
-    # elif off_policy_reshape == "p_div_p_0.1":
-    #     off_ratio = off_ratio / (off_ratio + 0.1)
-    # elif off_policy_reshape == "p_div_p_0.5":
-    #     off_ratio = off_ratio / (off_ratio + 0.5)
-    # elif off_policy_reshape == "p_div_p_0.3":
-    #     off_ratio = off_ratio / (off_ratio + 0.3)
-    # elif off_policy_reshape == "pow":
-    #     off_ratio = torch.pow(off_ratio, off_policy_reshape_pow_exp)
-    # else:
-    #     raise ValueError(f"Invalid off_policy_reshape: {off_policy_reshape}")
+    # 仅对 on-policy 区域统计 on_pg_loss
+    on_pg_loss = verl_F.masked_mean(on_pg_losses, on_mask)
 
-    # clip off-policy ratio
-    # if off_max_clip is not None:
-    #     off_ratio = torch.clamp(off_ratio, max=off_max_clip)
-    #     off_ratio_max_clip_frac = verl_F.masked_mean((off_ratio == off_max_clip).float(), prefix_mask * eos_mask)
-    # else:
-    #     off_ratio_max_clip_frac = torch.tensor(0.0)
+    # 4) off-policy（如果有）
+    if has_on_mask:
+        off_ratio = shape_off_policy(
+            off_policy_reshape, old_log_prob, log_prob,
+            policy_reshape_weight=off_policy_reshape_weight,
+            policy_reshape_pow_exp=off_policy_reshape_pow_exp
+        )
+        if all_max_clip is not None:
+            off_ratio = torch.clamp(off_ratio, max=all_max_clip)
+        if off_max_clip is not None:
+            off_ratio = torch.clamp(off_ratio, max=off_max_clip)
+        if off_min_clip is not None:
+            off_ratio = torch.clamp(off_ratio, min=off_min_clip)
 
-    # if off_min_clip is not None:
-    #     off_ratio = torch.clamp(off_ratio, min=off_min_clip)
-    #     off_ratio_min_clip_frac = verl_F.masked_mean((off_ratio == off_min_clip).float(), prefix_mask * eos_mask)
-    # else:
-    #     off_ratio_min_clip_frac = torch.tensor(0.0)
+        off_pg_losses = -advantages * off_ratio
+        off_pg_loss = verl_F.masked_mean(off_pg_losses, off_mask)
+        # 混合
+        pg_losses = on_pg_losses * on_mask.float() + off_pg_losses * off_mask.float()
+    else:
+        off_pg_loss = _zero_like_scalar(log_prob)
+        pg_losses = on_pg_losses
 
-    # off_ratio_mean = verl_F.masked_mean(off_ratio, prefix_mask * eos_mask)
-    # if off_ratio_mean.isnan().any().item():
-    #     off_ratio_mean = torch.tensor(0.0)
+    # 5) 总 loss 的归一化
+    if loss_remove_token_mean:
+        # 只按 batch 平均（去掉 token 级平均）
+        batch_size = log_prob.size(0)
+        pg_loss = (pg_losses * eos_mask).sum() / max(batch_size, 1)
+    else:
+        # 标准 masked mean
+        pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
 
-    # off_pg_losses = -advantages * off_ratio
-    # off_pg_loss = verl_F.masked_mean(off_pg_losses, prefix_mask * eos_mask)
-    # if off_pg_loss.isnan().item() is True:
-    #     off_pg_loss = torch.tensor(0.0)
-    # off_pg_clipfrac = torch.tensor(0.0)
-
-    # prefix_mask = prefix_mask.float()
-    # pg_losses = off_pg_losses * prefix_mask + on_pg_losses * (1 - prefix_mask)
-
-    # log on/off probs
-    # off_policy_probs = torch.exp(log_prob)
-    # off_policy_prob = verl_F.masked_mean(off_policy_probs, prefix_mask * eos_mask)
-    # if off_policy_prob.isnan().item() is True:
-    #     off_policy_prob = torch.tensor(0.0)
-    # on_policy_probs = torch.exp(old_log_prob)
-    # on_policy_prob = verl_F.masked_mean(on_policy_probs, (1.0-prefix_mask) * eos_mask)
-    # if on_policy_prob.isnan().item() is True:
-    #     on_policy_prob = torch.tensor(0.0)
-
-    # if all_max_clip is not None:
-    #     p_on = torch.exp(log_prob)
-    #     p_on_mask = (p_on <= all_max_clip).float()
-    #     eos_mask = eos_mask * p_on_mask
-    #     pg_losses = pg_losses * p_on_mask
-
-    # if loss_remove_token_mean is True:
-    #     pg_loss = (pg_losses * eos_mask).sum() / eos_mask.shape[-1]
-    #     print(f'no token mean: mean normalization {eos_mask.shape[-1]}')
-    # else:
-    #     pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
-    return pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl
+    return pg_loss, on_pg_loss, on_pg_clipfrac, off_pg_loss, ppo_kl
 
     # return {
     #     "pg_loss": pg_loss,
@@ -453,14 +481,15 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             per_param_files: bool = True,
             save_optimizer_state: bool = False,  # 如需离线做预条件余弦，建议 True
             step: int = 0,
-            mini_batch_idx: int = 0
+            mini_batch_idx: int = 0,
+            on_policy_mask: torch.Tensor | None = None,
     ):
         """
         计算一次 SFT/PG 的纯净梯度（与优化器状态一致的“分片梯度”），并可选直接落盘。
         - 当 save_dir 不为 None 时：流式拷贝到 CPU 并保存文件；返回 manifest（小字典）
         - 当 return_grads 为 True 时：返回 grads(list[Tensor|None])（不建议与 save_dir 同时用）
         """
-        assert which in ("sft", "pg")
+        assert which in ("sft", "pg", "on_pg", "off_pg")
         assert not (save_dir and return_grads), "建议二选一：要么落盘，要么返回列表"
 
         # FSDP/DDP 同步控制（False -> 同步 -> shard grads）
@@ -476,15 +505,13 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             if which == "sft":
                 loss_scalar = compute_sft_loss(all_log_prob_tmp, response)
             else:
-                loss_scalar, _, _, _ = compute_token_mixed_policy_loss(
+                loss_scalar, _, _, _, _ = compute_token_mixed_policy_loss(
                     old_log_prob=batch_data["old_log_probs"],
                     log_prob=all_log_prob_tmp,
                     advantages=batch_data["advantages"],
                     eos_mask=response,
-                    cliprange=clip_ratio,
                     cliprange_low=clip_ratio_low,
                     cliprange_high=clip_ratio_high,
-                    clip_ration_c=clip_ratio_c,
                     off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
                     off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
                     all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
@@ -496,6 +523,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
                     loss_remove_token_mean=self.config.loss_remove_token_mean,
                     loss_remove_clip=self.config.loss_remove_clip,
+                    on_policy_mask=on_policy_mask,
                 )
             loss_scalar.backward()  # 在 dp_no_sync=False 下，这里会做 reduce-scatter，得到“分片梯度”
 
@@ -522,7 +550,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         torch.distributed.is_available() and torch.distributed.is_initialized()) else 0
             world_size = torch.distributed.get_world_size() if (
                         torch.distributed.is_available() and torch.distributed.is_initialized()) else 1
-            root = Path(save_dir) / f"step_{step:03d}batch_idx_{mini_batch_idx:03d}" / which / f"rank_{rank:03d}"
+            root = Path(save_dir) / f"step_{step:03d}" / f"batch_idx_{mini_batch_idx:04d}" / which / f"rank_{rank:03d}"
             print(f"[MixedActor] 落盘目录：{root}")
             root.mkdir(parents=True, exist_ok=True)
 
@@ -751,10 +779,13 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
-        need_analyze_gradients = data.meta_info.get('need_analyze_gradients', False)
-        print(f'need analyze gradients: {need_analyze_gradients}')
+        need_analyze_sft_grads = data.meta_info.get('need_analyze_sft_grads', False)
+        print(f'need analyze sft gradients: {need_analyze_sft_grads}')
+        need_analyze_off_grads = data.meta_info.get('need_analyze_off_grads', False)
+        print(f'need analyze off policy gradients: {need_analyze_off_grads}')
         step_index = data.meta_info.get('step_index', 0)
         print(f'step index: {step_index}')
+        contain_off_policy = data.meta_info.get('contain_off_policy', False)
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -772,12 +803,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             "tgt_attention_mask",
             "tgt_responses"
         ]
+        if contain_off_policy:
+            select_keys.append('on_policy_mask')
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         select_data = data.select(batch_keys=select_keys)
         batch = select_data.batch
-        # non_tensor_batch = select_data.non_tensor_batch
-        # print(f'non tensors batch keys: {non_tensor_batch.keys()}')
+        non_tensor_batch = select_data.non_tensor_batch
+        # print(f' non tensors batch keys: {non_tensor_batch.keys()}')
         # for k, v in batch.items():
         #     print(f'{k}: {v.shape}')
         # print(non_tensor_batch['uid'])
@@ -787,25 +820,24 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         # print('ppo mini batch: ', self.config.ppo_mini_batch_size)
+        clip_ratio = self.config.clip_ratio
+        clip_ratio_low = (
+            self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+        )
+        clip_ratio_high = (
+            self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+        )
+        clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
         metrics = {}
         # print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
-                # print(f'data: {data}')
-                clip_ratio = self.config.clip_ratio
-                clip_ratio_low = (
-                    self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                )
-                clip_ratio_high = (
-                    self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                )
-                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-
+                # print(f' data: {data}')
                 responses_length = data[0]["responses"].shape[-1]
                 prompt_length = data[0]["input_ids"].shape[-1] - responses_length
 
-                if need_analyze_gradients:
-                    out_dir = self.config.get("analyze_dump_dir", "./grad_dumps")
+                if need_analyze_sft_grads:
+                    out_dir = self.config.get("analyze_dump_dir", "./grad_dumps/on_pg_sft")
                     sft_batch_data = data[0:1].clone()
                     sft_batch_data = TensorDict(
                         {'input_ids': sft_batch_data["tgt_input_ids"],
@@ -830,13 +862,63 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     )
                     rl_batch_data['response_mask'] = rl_batch_data['attention_mask'][:, prompt_length:]
                     pg_manifest = self._grab_grads_recompute("pg", rl_batch_data, rl_batch_data['response_mask'],
-                                temperature, dp_no_sync=False, clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high,
-                                clip_ratio_low=clip_ratio_low, clip_ratio_c=clip_ratio_c, return_grads=False,
-                                save_dir=out_dir, save_cpu_dtype=torch.float16, per_param_files=True,
-                                save_optimizer_state=False, step=step_index, mini_batch_idx=batch_idx)
+                            temperature, dp_no_sync=False, clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high,
+                            clip_ratio_low=clip_ratio_low, clip_ratio_c=clip_ratio_c, return_grads=False,
+                            save_dir=out_dir, save_cpu_dtype=torch.float16, per_param_files=True,
+                            save_optimizer_state=False, step=step_index, mini_batch_idx=batch_idx)
 
                     # mini_batch_metrics = self.analyze_grads(grads_sft, grads_pg)
                     del sft_batch_data, rl_batch_data
+
+                if need_analyze_off_grads:
+                    out_dir = self.config.get("analyze_dump_dir", "./grad_dumps/off_on_pg")
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    test_data = data.clone()
+                    on_pg_batch_data, off_pg_batch_data = split_on_policy_batch(test_data)
+                    on_pg_batch_data = TensorDict(
+                        {'input_ids': on_pg_batch_data["input_ids"],
+                         'attention_mask': on_pg_batch_data["attention_mask"],
+                         'position_ids': on_pg_batch_data["position_ids"],
+                         'responses': on_pg_batch_data["responses"],
+                         'old_log_probs': on_pg_batch_data["old_log_probs"],
+                         'advantages': on_pg_batch_data["advantages"],
+                        },
+                        batch_size=on_pg_batch_data.batch_size,
+                    )
+                    # print(f' on policy data: {on_pg_batch_data}')
+                    on_pg_batch_data['response_mask'] = on_pg_batch_data['attention_mask'][:, prompt_length:]
+                    on_pg_batch_data_splits, _ = rearrange_micro_batches(on_pg_batch_data, max_token_len)
+                    # print(f' on batch splits: {len(on_pg_batch_data_splits)}')
+                    for t, on_pg_batch_data_split in enumerate(on_pg_batch_data_splits):
+                        on_pg_manifest = self._grab_grads_recompute("on_pg", on_pg_batch_data_split,
+                                on_pg_batch_data_split['response_mask'], temperature, dp_no_sync=False,
+                                clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high, clip_ratio_low=clip_ratio_low,
+                                clip_ratio_c=clip_ratio_c, return_grads=False, save_dir=out_dir,
+                                save_cpu_dtype=torch.float16, per_param_files=True, save_optimizer_state=False,
+                                step=step_index, mini_batch_idx=t*100+batch_idx,
+                                on_policy_mask=torch.ones_like(on_pg_batch_data_split['response_mask']))
+                    off_pg_batch_data = TensorDict(
+                        {'input_ids': off_pg_batch_data["input_ids"],
+                         'attention_mask': off_pg_batch_data["attention_mask"],
+                         'position_ids': off_pg_batch_data["position_ids"],
+                         'responses': off_pg_batch_data["responses"],
+                         'old_log_probs': off_pg_batch_data["old_log_probs"],
+                         'advantages': off_pg_batch_data["advantages"],
+                        },
+                        batch_size=off_pg_batch_data.batch_size,
+                    )
+                    off_pg_batch_data['response_mask'] = off_pg_batch_data['attention_mask'][:, prompt_length:]
+                    # print(f' off policy data: {off_pg_batch_data}')
+                    off_pg_batch_data_splits, _ = rearrange_micro_batches(off_pg_batch_data, max_token_len)
+                    # print(f' off batch splits: {len(off_pg_batch_data_splits)}')
+                    for t, off_pg_batch_data_split in enumerate(off_pg_batch_data_splits):
+                        off_pg_manifest = self._grab_grads_recompute("off_pg", off_pg_batch_data_split,
+                                off_pg_batch_data_split['response_mask'], temperature, dp_no_sync=False,
+                                clip_ratio=clip_ratio, clip_ratio_high=clip_ratio_high, clip_ratio_low=clip_ratio_low,
+                                clip_ratio_c=clip_ratio_c, return_grads=False, save_dir=out_dir,
+                                save_cpu_dtype=torch.float16, per_param_files=True, save_optimizer_state=False,
+                                step=step_index, mini_batch_idx=t * 100 + batch_idx,
+                                on_policy_mask=torch.zeros_like(off_pg_batch_data_split['response_mask']))
 
                 # split batch into micro_batches
                 mini_batch = data
@@ -862,8 +944,6 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                 for index, data in enumerate(micro_batches):
                     micro_batch_metrics = {}
-                    
-                    # TODO: 将data翻倍，前一半是rl，后一半是sft。input_ids, attention_mask, position_ids, responses这四个成员需要翻倍
 
                     if self.config.calculate_sft_loss and self.config.calculate_rl_loss:
                         forward_batch_data = TensorDict(
@@ -872,10 +952,11 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                             'position_ids': torch.cat([data["position_ids"], data["position_ids"]], dim=0),
                             'responses': torch.cat([data["responses"], data["tgt_responses"]], dim=0),
                             'old_log_probs': torch.cat([data["old_log_probs"], data["old_log_probs"]], dim=0),
-                            'advantages': torch.cat([data["advantages"], data["advantages"]], dim=0),}
+                            'advantages': torch.cat([data["advantages"], data["advantages"]], dim=0),},
+                            batch_size=data.batch_size * 2,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        policy_mask = torch.cat([torch.ones_like(data["response_mask"]), torch.zeros_like(data["response_mask"])], dim=0).bool()
+                        forward_batch_data['policy_mask'] = torch.cat([torch.ones_like(data["response_mask"]), torch.zeros_like(data["response_mask"])], dim=0).bool()
                         old_log_prob = forward_batch_data["old_log_probs"]
                         advantages = forward_batch_data["advantages"]
                     elif not self.config.calculate_sft_loss and self.config.calculate_rl_loss:
@@ -885,21 +966,31 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                             'position_ids': data["position_ids"],
                             'responses': data["responses"],
                             'old_log_probs': data["old_log_probs"],
-                            'advantages': data["advantages"],}
+                            'advantages': data["advantages"],},
+                            batch_size=data.batch_size,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        policy_mask = torch.ones_like(data["response_mask"]).bool()
+                        forward_batch_data['policy_mask'] = torch.ones_like(data["response_mask"]).bool()
+                        if contain_off_policy:
+                            forward_batch_data['on_policy_mask'] = data["on_policy_mask"]
+                            # print(f'forward data {forward_batch_data}')
+                            forward_batch_data, _ = split_on_policy_batch(forward_batch_data)
+                            if forward_batch_data is None:
+                                continue
+                            # print(f'filtered on policy batch {forward_batch_data}')
                         old_log_prob = forward_batch_data["old_log_probs"]
                         advantages = forward_batch_data["advantages"]
                     elif self.config.calculate_sft_loss and not self.config.calculate_rl_loss:
+                        # 这个分支目前不会跑到
                         forward_batch_data = TensorDict(
                             {'input_ids': data["tgt_input_ids"],
                             'attention_mask': data["tgt_attention_mask"],
                             'position_ids': data["position_ids"],
-                            'responses': data["tgt_responses"],}
+                            'responses': data["tgt_responses"],},
+                            batch_size=data.batch_size,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        policy_mask = torch.zeros_like(data["tgt_responses"]).bool()
+                        forward_batch_data['policy_mask'] = torch.zeros_like(data["tgt_responses"]).bool()
                     else:
                         raise ValueError('both sft loss and rl loss are not calculated')
                     response_mask = forward_batch_data["response_mask"]
@@ -910,20 +1001,20 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     )
 
                     if self.config.calculate_sft_loss:
+                        policy_mask = forward_batch_data['policy_mask']
                         sft_loss = compute_sft_loss(all_log_prob[~policy_mask], response_mask[~policy_mask])
                         # print('sft loss: ', sft_loss)
                     else:
                         sft_loss = torch.tensor(0.0, device=get_device_id())
 
                     if self.config.calculate_rl_loss:
-                        pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl = compute_token_mixed_policy_loss(old_log_prob=old_log_prob[policy_mask],
+                        policy_mask = forward_batch_data['policy_mask']
+                        pg_loss, on_pg_loss, on_pg_clipfrac, off_pg_loss, ppo_kl = compute_token_mixed_policy_loss(old_log_prob=old_log_prob[policy_mask],
                             log_prob=all_log_prob[policy_mask],
                             advantages=advantages[policy_mask],
                             eos_mask=response_mask[policy_mask],
-                            cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
-                            clip_ration_c=clip_ratio_c,
                             off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
                             off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
                             all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,

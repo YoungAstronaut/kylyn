@@ -8,6 +8,7 @@ from pprint import pprint
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 from tqdm import tqdm
 
 from verl import DataProto
@@ -115,7 +116,8 @@ class RayMixedTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_output: DataProto = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        print(f'gen batch output: {gen_batch_output}')
                         # 这一部分返回只有五项：
                         # prompts: Tensor(shape=torch.Size([24, 2048]),),
                         # responses: Tensor(shape=torch.Size([24, 20480]),),
@@ -124,80 +126,43 @@ class RayMixedTrainer(RayPPOTrainer):
                         # position_ids: Tensor(shape=torch.Size([24, 22528]),),
                         n_off_policy = self.config.actor_rollout_ref.rollout.n_off_policy
                         if n_off_policy > 0:
-                            # TODO: 目前不会跑到这里，后面再来测试
                             required_keys = ["prompts", "responses", "input_ids", "attention_mask", "position_ids"]
                             assert all(key in gen_batch_output.batch for key in required_keys), "生成的序列数据缺少必要键"
 
-                            gen_batch_mixed_output = {}
-                            batch_size = new_batch.batch.batch_size
-                            total_samples = gen_batch_output.batch['prompts'].shape[0]
-                            
+                            batch_size = new_batch.batch.batch_size[0]
+
                             # 校验：数据总长度必须是batch_size的整数倍
+                            total_samples = gen_batch_output.batch['prompts'].shape[0]
                             assert total_samples % batch_size == 0, f"总样本数{total_samples}不是批次大小{batch_size}的整数倍"
-                            prompts_splits = torch.split(gen_batch_output.batch['prompts'], batch_size, dim=0)
-                            prompts_splits = [
-                                torch.cat(
-                                    [split] + [split[-1:,...]] * n_off_policy, 
-                                    dim=0
-                                ) 
-                                for split in prompts_splits
-                            ]
-                            gen_batch_mixed_output["prompts"] = torch.cat(prompts_splits, dim=0)
-                            responses_splits = torch.split(gen_batch_output.batch['responses'], batch_size, dim=0)
-                            tgt_input_ids_size = new_batch.batch['tgt_input_ids'].shape[-1]
-                            response_length = gen_batch_output.batch['responses'].shape[-1]
-                            responses_splits = [
-                                torch.cat(
-                                    [split] + 
-                                    [
-                                        torch.cat(
-                                            [new_batch.batch['tgt_input_ids'][i:i+1,...], torch.full((1, response_length-tgt_input_ids_size), self.tokenizer.pad_token_id)],
-                                            dim=-1
-                                        )
-                                    ] * n_off_policy, 
-                                    dim=0
-                                ) 
-                                for i, split in enumerate(responses_splits)
-                            ]
-                            gen_batch_mixed_output["responses"] = torch.cat(responses_splits, dim=0)
-                            gen_batch_mixed_output["input_ids"] = torch.cat([gen_batch_mixed_output["prompts"], gen_batch_mixed_output["responses"]], dim=-1)
-                            attention_mask_splits = torch.split(gen_batch_output.batch['attention_mask'], new_batch.batch.batch_size, dim=0)
-                            tgt_inputs_length = [(new_batch.batch['tgt_input_ids'][i,...]!=self.tokenizer.pad_token_id).sum().item() for i in range(new_batch.batch.batch_size)]
-                            attention_mask_splits = [
-                                torch.cat(
-                                    [split] + 
-                                    [
-                                        torch.cat([torch.full((1, tgt_inputs_length[i]), 1), torch.full((1, response_length-tgt_inputs_length[i]), 0)])
-                                    ] * n_off_policy,
-                                    dim=0
-                                )
-                                for i, split in enumerate(attention_mask_splits)
-                            ]
-                            gen_batch_mixed_output["attention_mask"] = torch.cat(attention_mask_splits, dim=0)
-                            position_ids_splits = torch.split(gen_batch_output.batch['position_ids'], new_batch.batch.batch_size, dim=0)
-                            position_ids_splits = [
-                                torch.cat(
-                                    [split] + [split[-1:,...]] * n_off_policy
-                                )
-                                for split in position_ids_splits
-                            ]
-                            gen_batch_mixed_output["position_ids"] = torch.cat(position_ids_splits, dim=0)
-                            prefix_mask = torch.zeros_like(gen_batch_mixed_output['responses'])
-                            prefix_mask[-n_off_policy:, ] = 1
-                            gen_batch_mixed_output["prefix_mask"] = prefix_mask
-                            for key in gen_batch_output.non_tensor_batch.keys():
-                                item = gen_batch_output.non_tensor_batch[key]
-                                splits = np.split(item, new_batch.batch.batch_size)
-                                splits = [
-                                    np.concatenate([split] + [split[-1]] * n_off_policy, axis=0)
-                                    for split in splits
-                                ]
-                                gen_batch_mixed_output[key] = np.concatenate(splits, axis=0)
-                            gen_batch_mixed_output = DataProto.from_single_dict(gen_batch_mixed_output)
+                            gen_batch_output_list = gen_batch_output.batch.split(int(total_samples // batch_size), dim=0)
+                            mixed_batch_output_list = []
+                            for idx, gen_batch_output_item in enumerate(gen_batch_output_list):
+                                off_prompts = gen_batch_output_item['prompts'][-1:,...].clone()
+                                off_responses = new_batch.batch['tgt_responses'][idx:idx+1,...].clone()
+                                off_input_ids = new_batch.batch['tgt_input_ids'][idx:idx+1,...].clone()
+                                off_attention_mask = new_batch.batch['tgt_attention_mask'][idx:idx+1,...].clone()
+                                off_position_ids = gen_batch_output_item['position_ids'][-1:,...].clone()
+                                off_tensor_dict = TensorDict({
+                                    "prompts": off_prompts,
+                                    "responses": off_responses,
+                                    "input_ids": off_input_ids,
+                                    "attention_mask": off_attention_mask,
+                                    "position_ids": off_position_ids,
+                                }, batch_size=[1])
+                                off_tensor_dict = torch.cat([off_tensor_dict] * n_off_policy, dim=0)
+                                mixed_batch_output_item: TensorDict = torch.cat([gen_batch_output_item, off_tensor_dict], dim=0)
+                                on_policy_mask = torch.ones_like(mixed_batch_output_item['responses'],
+                                                                 dtype=torch.int64)
+                                on_policy_mask[-n_off_policy:, ...] = 0
+                                mixed_batch_output_item['on_policy_mask'] = on_policy_mask
+                                mixed_batch_output_list.append(mixed_batch_output_item)
+                            gen_batch_output.batch = torch.cat(mixed_batch_output_list, dim=0)
+                            gen_batch_mixed_output = gen_batch_output
+
                         else:                           
                             gen_batch_mixed_output = gen_batch_output
-                            prefix_mask = torch.zeros_like(gen_batch_mixed_output.batch['responses'], dtype=torch.int64)
-                            gen_batch_mixed_output.batch['prefix_mask'] = prefix_mask
+                            on_policy_mask = torch.ones_like(gen_batch_mixed_output.batch['responses'], dtype=torch.int64)
+                            gen_batch_mixed_output.batch['on_policy_mask'] = on_policy_mask
                         
                         timing_raw.update(gen_batch_mixed_output.meta_info["timing"])
                         gen_batch_mixed_output.meta_info.pop("timing", None)
@@ -370,11 +335,15 @@ class RayMixedTrainer(RayPPOTrainer):
                         with marked_timer("update_actor", timing_raw, "red"):
                             # print('batch before update actor ', batch.batch)
                             # print(f' need_analyze_gradients: {self.config.trainer.need_analyze_gradients}')
-                            # print(f' save  gradients freq: {self.config.trainer.save_gradients_freq}')
-                            if self.config.trainer.get('need_analyze_gradients', False) \
-                                and self.global_steps % self.config.trainer.get('save_gradients_freq', 10) == 0:
-                                batch.meta_info['need_analyze_gradients'] = True
+                            # print(f' save  gradients freq: {self.config.trainer.analyze_gradients_freq}')
+                            if self.global_steps % self.config.trainer.get('analyze_gradients_freq', 10) == 0:
                                 batch.meta_info['step_index'] = self.global_steps
+                                if self.config.trainer.get('need_analyze_sft_grads', False):
+                                    batch.meta_info['need_analyze_sft_grads'] = True
+                                if self.config.trainer.get('need_analyze_off_grads', False):
+                                    batch.meta_info['need_analyze_off_grads'] = True
+                            if self.config.actor_rollout_ref.rollout.n_off_policy > 0:
+                                batch.meta_info['contain_off_policy'] = True
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

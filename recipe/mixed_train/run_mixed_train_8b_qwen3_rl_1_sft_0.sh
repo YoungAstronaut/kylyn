@@ -125,7 +125,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.norm_adv_by_std_in_grpo=False \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
-    actor_rollout_ref.rollout.n_off_policy=0 \
+    actor_rollout_ref.rollout.n_off_policy=1 \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -186,7 +186,8 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.test_freq=5 \
     trainer.save_freq=20 \
     trainer.total_epochs=1 \
-    trainer.need_analyze_gradients=True \
-    trainer.save_gradients_freq=30 \
+    trainer.need_analyze_sft_grads=False \
+    trainer.need_analyze_off_grads=True \
+    trainer.analyze_gradients_freq=10 \
     trainer.default_local_dir="${default_local_dir}" \
     trainer.resume_mode=auto 2>&1 | tee ${log_filename}
