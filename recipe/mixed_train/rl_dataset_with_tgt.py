@@ -139,11 +139,14 @@ class RLHFDatasetWithTarget(RLHFDataset):
         
         if tgt is not None and sample is True:
             tgt = tgt[0]
-        
+
             if prompt_with_chat_template.endswith('<think>\n') and tgt['content'].startswith('<think>\n'):
                 tgt['content'] = tgt['content'][len('<think>\n'):]
             tgt_input_ids = self.tokenizer(tgt['content'], add_special_tokens=False, return_tensors='pt')['input_ids'].reshape(-1) # [1, l]
-
+            if '</think>\n' in tgt['content']:
+                row_dict['raw_tgt_prompts'] = tgt['content'].split('</think>\n')[-1].strip()
+            else:
+                row_dict['raw_tgt_prompts'] = tgt['content']
             # NOTE: we don't need to do this because we add eos token id at mix_vllm_rollout.py
             
             # if tgt_input_ids[-1].item() != self.tokenizer.eos_token_id:

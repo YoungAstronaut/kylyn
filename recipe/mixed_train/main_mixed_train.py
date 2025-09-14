@@ -7,12 +7,13 @@ import socket
 
 import hydra
 import ray
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf
 
-from verl.trainer.ppo.reward import get_custom_reward_fn
+from recipe.mixed_train.AnswersChecker import AnswersChecker
 from verl.utils.device import is_cuda_available
 
-from .mixed_ray_trainer import RayMixedTrainer
+from .mixed_ray_trainer import RayMixedTrainer, Role
+
 
 @hydra.main(config_path="config", config_name="mixed_trainer", version_base=None)
 def main(config):
@@ -85,11 +86,12 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(MixedTrainActorRefWorker),
             Role.Critic: ray.remote(CriticWorker),
+            Role.AnswersChecker: ray.remote(AnswersChecker),
         }
 
         global_pool_id = "global_pool"
@@ -99,6 +101,7 @@ class TaskRunner:
         mapping = {
             Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
+            Role.AnswersChecker: global_pool_id,
         }
 
         # we should adopt a multi-source reward function here

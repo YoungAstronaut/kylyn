@@ -4,16 +4,23 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 import uuid
 from collections import defaultdict
+from enum import Enum
 from pprint import pprint
+from typing import Optional
 
 import numpy as np
 import torch
+from datasets import Dataset
+from omegaconf import OmegaConf
 from tensordict import TensorDict
+from torch.utils.data import Sampler
 from tqdm import tqdm
 
 from verl import DataProto
 from verl.protocol import unpad_dataproto, pad_dataproto_to_divisor
-from verl.trainer.ppo.core_algos import agg_loss
+from verl.single_controller.ray import RayClassWithInitArgs, create_colocated_worker_cls, RayWorkerGroup
+from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.core_algos import agg_loss, AdvantageEstimator
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -23,16 +30,236 @@ from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     apply_kl_penalty,
     compute_advantage,
-    compute_response_mask,
+    compute_response_mask, ResourcePoolManager, WorkerType,
 )
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
+from verl.utils.tracking import ValidationGenerationsLogger
+
+
+class Role(Enum):
+    Actor = 0
+    Rollout = 1
+    ActorRollout = 2
+    Critic = 3
+    RefPolicy = 4
+    RewardModel = 5
+    ActorRolloutRef = 6
+    AnswersChecker = 7
 
 
 class RayMixedTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        collate_fn=None,
+        train_sampler: Optional[Sampler] = None,
+        device_name="cuda",
+    ):
+        """
+        Initialize distributed PPO trainer with Ray backend.
+        Note that this trainer runs on the driver process on a single CPU/GPU node.
+
+        Args:
+            config: Configuration object containing training parameters.
+            tokenizer: Tokenizer used for encoding and decoding text.
+            role_worker_mapping (dict[Role, WorkerType]): Mapping from roles to worker classes.
+            resource_pool_manager (ResourcePoolManager): Manager for Ray resource pools.
+            ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
+            processor: Optional data processor, used for multimodal data
+            reward_fn: Function for computing rewards during training.
+            val_reward_fn: Function for computing rewards during validation.
+            train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
+            val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
+            collate_fn: Function to collate data samples into batches.
+            train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
+            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to "cuda".
+        """
+
+        # Store the tokenizer for text processing
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.config = config
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
+
+        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        assert self.hybrid_engine, "Currently, only support hybrid engine"
+
+        if self.hybrid_engine:
+            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
+
+        self.role_worker_mapping = role_worker_mapping
+        self.resource_pool_manager = resource_pool_manager
+        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
+        self.use_rm = Role.RewardModel in role_worker_mapping
+        self.ray_worker_group_cls = ray_worker_group_cls
+        self.device_name = device_name
+        self.validation_generations_logger = ValidationGenerationsLogger()
+
+        # if ref_in_actor is True, the reference policy will be actor without lora applied
+        self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+
+        # define in-reward KL control
+        # kl loss control currently not suppoorted
+        if self.config.algorithm.use_kl_in_reward:
+            self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+            self.use_critic = True
+        elif self.config.algorithm.adv_estimator in [
+            AdvantageEstimator.GRPO,
+            AdvantageEstimator.GRPO_PASSK,
+            AdvantageEstimator.REINFORCE_PLUS_PLUS,
+            AdvantageEstimator.REMAX,
+            AdvantageEstimator.RLOO,
+            AdvantageEstimator.OPO,
+            AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+            AdvantageEstimator.GPG,
+        ]:
+            self.use_critic = False
+        else:
+            raise NotImplementedError
+
+        self._validate_config()
+        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def init_workers(self):
+        """Initialize distributed training workers using Ray backend.
+
+        Creates:
+        1. Ray resource pools from configuration
+        2. Worker groups for each role (actor, critic, etc.)
+        """
+        self.resource_pool_manager.create_resource_pool()
+
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        # create actor and rollout
+        if self.hybrid_engine:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            actor_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=self.config.actor_rollout_ref,
+                role="actor_rollout",
+                profile_option=self.config.trainer.npu_profile.options,
+            )
+            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+        else:
+            raise NotImplementedError
+
+        # create critic
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+
+        # create reference policy if needed
+        if self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role="ref",
+                profile_option=self.config.trainer.npu_profile.options,
+            )
+            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+
+        # create a reward model if reward_fn is None
+        if self.use_rm:
+            # we create a RM here
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+
+        # 新添加的内容
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.AnswersChecker)
+        ac_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.AnswersChecker], config=self.config.answers_checker)
+        ac_runtime_env = {
+            "runtime_env": {
+                "env_vars": {
+                    "VLLM_USE_V1": "0",  # embed task needs V0
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "VLLM_LOGGING_LEVEL": "WARN",
+                }
+            }
+        }
+        ac_cls.update_options(ac_runtime_env)
+
+        self.resource_pool_to_cls[resource_pool]["ac"] = ac_cls
+
+        # initialize WorkerGroup
+        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
+        # you should not use `create_colocated_worker_cls`.
+        # Instead, directly pass different resource pool to different worker groups.
+        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        all_wg = {}
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
+            assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, (
+                "worker_nsight_options must be set when profile_steps is set"
+            )
+            wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                OmegaConf.select(self.config.trainer, "worker_nsight_options")
+            )
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            print(f'class dict: {class_dict}')
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                device_name=self.device_name,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        if self.use_critic:
+            self.critic_wg = all_wg["critic"]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = all_wg["ref"]
+            self.ref_policy_wg.init_model()
+
+        if self.use_rm:
+            self.rm_wg = all_wg["rm"]
+            self.rm_wg.init_model()
+
+        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        self.actor_rollout_wg = all_wg["actor_rollout"]
+        self.actor_rollout_wg.init_model()
+
+        self.answers_checker_wg = all_wg["ac"]
+        self.answers_checker_wg.init_model()
+
+        # create async rollout manager and request scheduler
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            from verl.experimental.agent_loop import AgentLoopManager
+
+            self.async_rollout_mode = True
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+            )
 
     def fit(self):
         """
@@ -98,6 +325,7 @@ class RayMixedTrainer(RayPPOTrainer):
                             self.rm_wg.start_profile()
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # print(f' new batch: {new_batch}')
                 num_gen_batches += 1
                 # pop those keys for generation
                 gen_batch = new_batch.pop(
@@ -117,7 +345,7 @@ class RayMixedTrainer(RayPPOTrainer):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
                         gen_batch_output: DataProto = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        print(f'gen batch output: {gen_batch_output}')
+                        # print(f'gen batch output: {gen_batch_output}')
                         # 这一部分返回只有五项：
                         # prompts: Tensor(shape=torch.Size([24, 2048]),),
                         # responses: Tensor(shape=torch.Size([24, 20480]),),
@@ -294,7 +522,7 @@ class RayMixedTrainer(RayPPOTrainer):
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
+                        # old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
@@ -302,12 +530,6 @@ class RayMixedTrainer(RayPPOTrainer):
                         with marked_timer("ref", timing_raw, "olive"):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, "cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, "brown"):
                         # compute advantages, executed on the driver process
@@ -321,19 +543,18 @@ class RayMixedTrainer(RayPPOTrainer):
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         )
+                    # print(f' test_batch: {batch}')
+                    # print(f' non tensors batch keys(): {batch.non_tensor_batch.keys()}')
+                    # torch.save(batch.batch, os.path.join('entropy_examples', f'{self.global_steps}.pt'))
 
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, "pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                    # TODO: 分块检测相似性
+                    batch = self.answers_checker_wg.generate_answers_mask(batch)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            # print('batch before update actor ', batch.batch)
+                            print('batch before update actor ', batch)
                             # print(f' need_analyze_gradients: {self.config.trainer.need_analyze_gradients}')
                             # print(f' save  gradients freq: {self.config.trainer.analyze_gradients_freq}')
                             if self.global_steps % self.config.trainer.get('analyze_gradients_freq', 10) == 0:
