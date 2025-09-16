@@ -24,6 +24,33 @@ reward_model:
     penalty_factor: 0.0
     log: False
 
+answers_checker:
+  ulysses_sequence_parallel_size: 1
+  use_remove_padding: True
+  model:
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: False
+      reshard_after_forward: True
+      fsdp_size: -1
+    forward_prefetch: False
+  # 配置vllm的参数
+  free_cache_engine: False
+  tensor_parallel_size: 2
+  dtype: bfloat16
+  enforce_eager: True
+  gpu_memory_utilization: 0.8
+  load_format: dummy_dtensor
+  disable_log_stats: True
+  max_num_batched_tokens: 16384
+  max_model_len: 16384
+  enable_chunked_prefill: False
+  embedding_model:
+    enable: True
+    path: Qwen3/Qwen3-Embedding-4B
+  similarity_threshold: 0.2
+  max_blocks_num: 10
 
 algorithm:
   filter_groups:
@@ -36,6 +63,10 @@ actor_rollout_ref:
   rollout:
     calculate_log_probs: False
     n_off_policy: 1
+    self_explain:
+      max_tokens: 100
+      max_blocks_num: 5
+    chunk_size: 8
   actor:
     use_off_policy_loss: False
     off_policy_normalize: False

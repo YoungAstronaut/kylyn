@@ -363,6 +363,8 @@ def rearrange_micro_batches_with_targets(
     else:
         raise ValueError("with_sft and with_rl cannot be both False")
     total_seqlen = seq_len_effective.sum().item()
+    print(f'total seq len {total_seqlen}')
+    # print(f'seq_len_effective: {seq_len_effective}')
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
     if min_num_micro_batch is not None:
@@ -779,6 +781,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        # print(f' data meta info: {data.meta_info}')
         need_analyze_sft_grads = data.meta_info.get('need_analyze_sft_grads', False)
         print(f'need analyze sft gradients: {need_analyze_sft_grads}')
         need_analyze_off_grads = data.meta_info.get('need_analyze_off_grads', False)
@@ -786,6 +789,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         step_index = data.meta_info.get('step_index', 0)
         print(f'step index: {step_index}')
         contain_off_policy = data.meta_info.get('contain_off_policy', False)
+        calculate_sft_loss = data.meta_info.get('calculate_sft_loss', None)
+        if calculate_sft_loss is None:
+            calculate_sft_loss = self.config.calculate_sft_loss
+        print(f'calculate_sft_loss: {calculate_sft_loss}')
+        calculate_rl_loss = data.meta_info.get('calculate_rl_loss', None)
+        if calculate_rl_loss is None:
+            calculate_rl_loss = self.config.calculate_rl_loss
+        print(f'calculate_rl_loss: {calculate_rl_loss}')
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -928,7 +939,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches_with_targets(
                         batch=mini_batch, max_token_len=max_token_len,
-                        with_sft=self.config.calculate_sft_loss, with_rl=self.config.calculate_rl_loss)
+                        with_sft=calculate_sft_loss, with_rl=calculate_rl_loss)
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -944,8 +955,9 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                 for index, data in enumerate(micro_batches):
                     micro_batch_metrics = {}
+                    # print(f'micro batch data: {data}')
 
-                    if self.config.calculate_sft_loss and self.config.calculate_rl_loss:
+                    if calculate_sft_loss and calculate_rl_loss:
                         forward_batch_data = TensorDict(
                             {'input_ids': torch.cat([data["input_ids"], data["tgt_input_ids"]], dim=0),
                             'attention_mask': torch.cat([data["attention_mask"], data["tgt_attention_mask"]], dim=0),
@@ -953,13 +965,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                             'responses': torch.cat([data["responses"], data["tgt_responses"]], dim=0),
                             'old_log_probs': torch.cat([data["old_log_probs"], data["old_log_probs"]], dim=0),
                             'advantages': torch.cat([data["advantages"], data["advantages"]], dim=0),},
-                            batch_size=data.batch_size * 2,
+                            batch_size=data.batch_size[0]*2,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        forward_batch_data['policy_mask'] = torch.cat([torch.ones_like(data["response_mask"]), torch.zeros_like(data["response_mask"])], dim=0).bool()
+                        forward_batch_data['policy_mask'] = torch.cat(
+                            [torch.ones_like(data["response_mask"]), torch.zeros_like(data["response_mask"])], dim=0).bool()
                         old_log_prob = forward_batch_data["old_log_probs"]
                         advantages = forward_batch_data["advantages"]
-                    elif not self.config.calculate_sft_loss and self.config.calculate_rl_loss:
+                    elif not calculate_sft_loss and calculate_rl_loss:
                         forward_batch_data = TensorDict(
                             {'input_ids': data["input_ids"],
                             'attention_mask': data["attention_mask"],
@@ -980,7 +993,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                             # print(f'filtered on policy batch {forward_batch_data}')
                         old_log_prob = forward_batch_data["old_log_probs"]
                         advantages = forward_batch_data["advantages"]
-                    elif self.config.calculate_sft_loss and not self.config.calculate_rl_loss:
+                    elif calculate_sft_loss and not calculate_rl_loss:
                         # 这个分支目前不会跑到
                         forward_batch_data = TensorDict(
                             {'input_ids': data["tgt_input_ids"],
@@ -995,21 +1008,23 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         raise ValueError('both sft loss and rl loss are not calculated')
                     response_mask = forward_batch_data["response_mask"]
 
+                    # print(f' forward batch data: {forward_batch_data}')
                     # all return: (bsz, response_length)
                     entropy, all_log_prob = self._forward_micro_batch(
                         micro_batch=forward_batch_data, temperature=temperature
                     )
 
-                    if self.config.calculate_sft_loss:
+                    if calculate_sft_loss:
                         policy_mask = forward_batch_data['policy_mask']
                         sft_loss = compute_sft_loss(all_log_prob[~policy_mask], response_mask[~policy_mask])
                         # print('sft loss: ', sft_loss)
                     else:
                         sft_loss = torch.tensor(0.0, device=get_device_id())
 
-                    if self.config.calculate_rl_loss:
+                    if calculate_rl_loss:
                         policy_mask = forward_batch_data['policy_mask']
-                        pg_loss, on_pg_loss, on_pg_clipfrac, off_pg_loss, ppo_kl = compute_token_mixed_policy_loss(old_log_prob=old_log_prob[policy_mask],
+                        pg_loss, on_pg_loss, on_pg_clipfrac, off_pg_loss, ppo_kl = compute_token_mixed_policy_loss(
+                            old_log_prob=old_log_prob[policy_mask],
                             log_prob=all_log_prob[policy_mask],
                             advantages=advantages[policy_mask],
                             eos_mask=response_mask[policy_mask],
@@ -1040,18 +1055,19 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     # TODO: 看看适应性温度的影响，可以参考：/home/hzchen/jyh/LUFFY-main/luffy/verl/verl/mix_src/mix_actor.py
                     # 中的 205 行开始的内容
 
-                    if self.config.calculate_sft_loss and self.config.calculate_rl_loss:
+                    if calculate_sft_loss and calculate_rl_loss:
                         if self.config.sft_loss_coef < 1e-4:
                             all_loss = pg_loss
                         else:
                             all_loss = pg_loss + sft_loss * self.config.sft_loss_coef
-                    elif self.config.calculate_sft_loss and not self.config.calculate_rl_loss:
+                    elif calculate_sft_loss and not calculate_rl_loss:
                         all_loss = sft_loss * self.config.sft_loss_coef
-                    elif not self.config.calculate_sft_loss and self.config.calculate_rl_loss:
+                    elif not calculate_sft_loss and calculate_rl_loss:
                         all_loss = pg_loss
                     else:
                         raise ValueError('both sft loss and rl loss are not calculated')
 
+                    # print(f'all loss: {all_loss}')
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = all_loss * (len(data) / self.config.ppo_mini_batch_size)
@@ -1059,11 +1075,11 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         loss = all_loss / self.gradient_accumulation
                     loss.backward()
 
-                    if self.config.calculate_sft_loss:
+                    if calculate_sft_loss:
                         micro_batch_metrics["actor/sft_loss"] = sft_loss.detach().item()
                         micro_batch_metrics["actor/sft_coef"] = self.config.sft_loss_coef
 
-                    if self.config.calculate_rl_loss:
+                    if calculate_rl_loss:
                         micro_batch_metrics.update(
                             {
                                 "actor/pg_loss": pg_loss.detach().item(),

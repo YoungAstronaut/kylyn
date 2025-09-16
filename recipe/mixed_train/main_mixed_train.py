@@ -9,7 +9,7 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from recipe.mixed_train.AnswersChecker import AnswersChecker
+from recipe.mixed_train.answers_checker import AnswersChecker
 from verl.utils.device import is_cuda_available
 
 from .mixed_ray_trainer import RayMixedTrainer, Role

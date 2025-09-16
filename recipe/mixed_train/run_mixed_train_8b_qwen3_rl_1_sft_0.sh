@@ -90,6 +90,7 @@ ppo_mini_bsz=64
 
 # Paths
 model_path=$HOME/jyh/llm_models/Qwen/Qwen2.5-Math-7B-16k-think
+embedding_model_path=$HOME/jyh/llm_models/Qwen/Qwen3-Embedding-4B
 default_local_dir=${output_path}/${project_name}/${experiment_name}
 log_filename=${log_path}/${project_name}/${experiment_name}.log
 mkdir -p ${log_path}/${project_name}
@@ -125,7 +126,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.norm_adv_by_std_in_grpo=False \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
-    actor_rollout_ref.rollout.n_off_policy=1 \
+    actor_rollout_ref.rollout.n_off_policy=0 \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -177,6 +178,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
+    answers_checker.embedding_model.path="${embedding_model_path}" \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
@@ -187,7 +189,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.save_freq=20 \
     trainer.total_epochs=1 \
     trainer.need_analyze_sft_grads=False \
-    trainer.need_analyze_off_grads=True \
-    trainer.analyze_gradients_freq=10 \
+    trainer.need_analyze_off_grads=False \
+    trainer.analyze_gradients_freq=30 \
     trainer.default_local_dir="${default_local_dir}" \
     trainer.resume_mode=auto 2>&1 | tee ${log_filename}

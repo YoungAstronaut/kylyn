@@ -34,6 +34,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
+from verl.utils.torch_functional import pad_sequence_to_length, get_response_mask
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
@@ -261,6 +262,164 @@ class RayMixedTrainer(RayPPOTrainer):
                 worker_group=self.actor_rollout_wg,
             )
 
+    def construct_explain_prompt(self, question: str, standard_answer: str, answer_prefix: str):
+        chat = [
+            {
+                "content": f"Your task is to understand a given standard problem solving process of a given question, "
+                           f"then finish an incomplete reasoning process. The question is {question} The standard "
+                           f"solving process is as followings: \n{standard_answer}",
+                "role": "system"
+            },
+            {
+                "content": f"Finish the following incomplete answer: \n{answer_prefix}",
+                "role": "user"
+            }
+        ]
+        return self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+
+    def gather_sft_blocks_input(self, prompts: DataProto):
+        prompts_ids = prompts.batch["prompts"]
+        position_ids = prompts.batch["position_ids"]
+        advantages = prompts.batch["advantages"]
+        old_log_probs = prompts.batch["old_log_probs"]
+        raw_target_prompts = prompts.non_tensor_batch["raw_tgt_prompts"]
+        decoded_questions = self.tokenizer.batch_decode(prompts_ids, skip_special_tokens=True)
+        print(f'sampled questions: {decoded_questions[0]}')
+        decoded_questions = [question.split('User:')[1].split('Assistant:')[0] for question in decoded_questions]
+        print(f'sampled questions: {decoded_questions[0]}')
+
+        responses = prompts.batch["responses"]
+        filtered_blocks = prompts.non_tensor_batch["filtered_blocks"]
+        batch_size = prompts.batch.batch_size[0]
+        total_nums = prompts_ids.shape[0]
+        print(f'total_nums: {total_nums}')
+
+        new_responses = []
+        tgt_responses = []
+        new_responses_mask = []
+        new_prompts_ids = []
+        new_position_ids = []
+        new_advantages = []
+        new_old_log_probs = []
+        answers_prefix = []
+        questions = []
+        raw_target_prompts_selected = []
+        max_blocks_num = self.config.actor_rollout_ref.rollout.self_explain.max_blocks_num
+        for i in range(batch_size):
+            if len(filtered_blocks[i]) == 0:
+                continue
+            blocks_per_question = filtered_blocks[i] if len(filtered_blocks[i]) < max_blocks_num \
+                else filtered_blocks[i][:max_blocks_num]
+            for block in blocks_per_question:
+                start = block[0]
+                if start == 0:
+                    continue
+                end = block[1]
+                # print(f'start: {start}, end: {end}')
+                new_responses.append(responses[i:i+1,:end])
+                new_responses_mask_item = torch.zeros_like(responses[i:i+1,...])
+                new_responses_mask_item[...,start:end] = 1
+                new_responses_mask.append(new_responses_mask_item)
+
+                tgt_responses.append(responses[i:i + 1, :start])
+                # print(f' new responses: {new_responses[-1].shape}')
+                # print(f' new tgt responses: {tgt_responses[-1].shape}')
+
+                new_prompts_ids.append(prompts_ids[i:i+1,...])
+                new_position_ids.append(position_ids[i:i+1,...])
+                new_advantages.append(advantages[i:i+1,...])
+                new_old_log_probs.append(old_log_probs[i:i+1,...])
+                answers_prefix.append(self.tokenizer.decode(responses[i][:start]))
+                questions.append(decoded_questions[i])
+                raw_target_prompts_selected.append(raw_target_prompts[i])
+                assert answers_prefix[-1].strip() != "", \
+                    f"Answer prefix should not be empty {start}, {self.tokenizer.decode(responses[i])}"
+                # print(f' answers prefix: {answers_prefix[-1]}')
+        explain_prompts = []
+        for i in range(len(questions)):
+            explain_prompts.append(self.construct_explain_prompt(questions[i], raw_target_prompts_selected[i],
+                                                                 answers_prefix[i]))
+        print(f' explain texts length: {len(explain_prompts)}')
+        print(f' sampled explain prompts: {explain_prompts[0]}')
+        # print(f' sampled explain prompts: {explain_prompts[1]}')
+        explain_prompts_input_ids = \
+            [self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")['input_ids'] for prompt in
+             explain_prompts]
+        explain_prompts_attention_mask = \
+            [self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")['attention_mask'] for prompt in
+             explain_prompts]
+        max_input_ids_length = max([input_ids.shape[1] for input_ids in explain_prompts_input_ids])
+        print(f'max input ids length: {max_input_ids_length}')
+        explain_prompts_input_ids = [
+            pad_sequence_to_length(prompt, max_input_ids_length, self.tokenizer.pad_token_id, left_pad=True)
+            for prompt in explain_prompts_input_ids]
+        explain_prompts_attention_mask = [
+            pad_sequence_to_length(prompt, max_input_ids_length, 0, left_pad=True) for prompt in
+            explain_prompts_attention_mask]
+
+        # if len(explain_prompts_input_ids) % self.config.actor_rollout_ref.rollout.chunk_size != 0:
+        #     pad_times = self.config.actor_rollout_ref.rollout.chunk_size - len(explain_prompts_input_ids) % \
+        #                                                                   self.config.actor_rollout_ref.rollout.chunk_size
+        if len(explain_prompts_input_ids) < total_nums:
+            pad_times = total_nums - len(explain_prompts_input_ids)
+            for i in range(pad_times):
+                explain_prompts_input_ids.append(torch.zeros_like(explain_prompts_input_ids[0]))
+                explain_prompts_attention_mask.append(torch.zeros_like(explain_prompts_attention_mask[0]))
+                new_responses.append(torch.zeros_like(responses[0:1,...]))
+                tgt_responses.append(torch.zeros_like(responses[0:1,...]))
+                new_responses_mask.append(torch.zeros_like(new_responses_mask[0]))
+                new_prompts_ids.append(torch.zeros_like(new_prompts_ids[0]))
+                new_advantages.append(torch.zeros_like(new_advantages[0]))
+                new_old_log_probs.append(torch.zeros_like(new_old_log_probs[0]))
+                answers_prefix.append('')
+                raw_target_prompts_selected.append('')
+                new_position_ids.append(torch.zeros_like(new_position_ids[0]))
+                questions.append('')
+        elif len(explain_prompts_input_ids) > total_nums:
+            explain_prompts_input_ids = explain_prompts_input_ids[:total_nums]
+            explain_prompts_attention_mask = explain_prompts_attention_mask[:total_nums]
+            new_responses = new_responses[:total_nums]
+            tgt_responses = tgt_responses[:total_nums]
+            new_responses_mask = new_responses_mask[:total_nums]
+            new_prompts_ids = new_prompts_ids[:total_nums]
+            new_advantages = new_advantages[:total_nums]
+            new_old_log_probs = new_old_log_probs[:total_nums]
+            answers_prefix = answers_prefix[:total_nums]
+            raw_target_prompts_selected = raw_target_prompts_selected[:total_nums]
+            new_position_ids = new_position_ids[:total_nums]
+            questions = questions[:total_nums]
+            pad_times = 0
+        else:
+            pad_times = 0
+        explain_prompts_input_ids = torch.cat(explain_prompts_input_ids, dim=0)
+        explain_prompts_attention_mask = torch.cat(explain_prompts_attention_mask, dim=0)
+        # print(f'input ids: {explain_prompts_input_ids}, shape: {explain_prompts_input_ids.shape}')
+        # print(f'attention mask: {explain_prompts_attention_mask}, shape: {explain_prompts_attention_mask.shape}')
+        assert explain_prompts_input_ids.shape == explain_prompts_attention_mask.shape, \
+            f"Input ids shape: {explain_prompts_input_ids.shape}, attention mask shape: {explain_prompts_attention_mask.shape}"
+
+        batch = TensorDict(
+            {
+                "input_ids": explain_prompts_input_ids,
+                "attention_mask": explain_prompts_attention_mask,
+                "response_mask": torch.cat(new_responses_mask, dim=0),
+                "prompts": torch.cat(new_prompts_ids, dim=0),
+                "position_ids": torch.cat(new_position_ids, dim=0),
+                "advantages": torch.cat(new_advantages, dim=0),
+                "old_log_probs": torch.cat(new_old_log_probs, dim=0),
+            },
+            batch_size=explain_prompts_input_ids.shape[0],
+        )
+        batch["tgt_attention_mask"] = torch.cat([(batch["prompts"] != self.tokenizer.pad_token_id).int()], dim=-1)
+        non_tensor_batch = {
+                "answers_prefix": np.array(answers_prefix, dtype=object),
+                "questions": np.array(questions, dtype=object),
+                "raw_target_prompts": np.array(raw_target_prompts_selected, dtype=object),
+            }
+        vllm_inputs = DataProto(batch, non_tensor_batch)
+
+        return vllm_inputs, new_responses, pad_times, tgt_responses
+
     def fit(self):
         """
         The training loop of PPO.
@@ -341,7 +500,7 @@ class RayMixedTrainer(RayPPOTrainer):
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
-                with marked_timer("step", timing_raw):
+                with (marked_timer("step", timing_raw)):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
                         gen_batch_output: DataProto = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -549,12 +708,68 @@ class RayMixedTrainer(RayPPOTrainer):
 
                     # TODO: 分块检测相似性
                     batch = self.answers_checker_wg.generate_answers_mask(batch)
+                    # print(f' batch: {batch.batch}')
+
+                    sft_blocks_inputs, incomplete_responses, pad_times, tgt_incomplete_responses = \
+                                    self.gather_sft_blocks_input(batch)
+                    sft_inputs_batch = sft_blocks_inputs.pop(
+                        batch_keys=["input_ids", "attention_mask"]
+                    )
+                    # print(f' sft blocks input: {sft_blocks_inputs}')
+                    sft_blocks_result = self.actor_rollout_wg.generate_sft_blocks(sft_inputs_batch)
+                    # print(f'sft_blocks_result: {sft_blocks_result}')
+                    pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
+                    prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
+
+                    # 用于强化学习的input_ids、attention_mask
+                    sft_blocks_inputs.batch['responses'] = torch.cat(
+                        [pad_sequence_to_length(response, pad_length, self.tokenizer.pad_token_id, left_pad=False)
+                         for response in incomplete_responses], dim=0
+                    )
+                    sft_blocks_inputs.batch['input_ids'] = torch.cat(
+                        [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['responses']], dim=1
+                    )
+                    sft_blocks_inputs.batch['attention_mask'] = torch.cat(
+                        [sft_blocks_inputs.batch['tgt_attention_mask'], sft_blocks_inputs.batch['response_mask']],
+                        dim=-1
+                    )
+
+                    sft_blocks_inputs.batch['tgt_responses'] = torch.cat(
+                        [pad_sequence_to_length(
+                            torch.cat([response, sft_blocks_result.batch['responses'][idx:idx+1,...]], dim=-1),
+                            pad_length, self.tokenizer.pad_token_id, left_pad=False)
+                         for idx, response in enumerate(tgt_incomplete_responses)], dim=0
+                    )
+                    sft_blocks_inputs.batch['tgt_input_ids'] = torch.cat(
+                        [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['tgt_responses']], dim=1
+                    )
+                    pad_tgt_attention_mask = torch.zeros_like(sft_blocks_inputs.batch['response_mask'])
+                    for idx, response in enumerate(tgt_incomplete_responses):
+                        response_length = response.shape[-1]
+                        start = prompt_length+response_length
+                        end = start+sft_blocks_result.batch['responses'].shape[1]
+                        pad_tgt_attention_mask[idx:idx+1, start:end] = 1
+                    sft_blocks_inputs.batch['tgt_attention_mask'] = torch.cat(
+                        [sft_blocks_inputs.batch['tgt_attention_mask'], pad_tgt_attention_mask], dim=-1
+                    )
+                    # for idx in range(sft_blocks_inputs.batch['tgt_attention_mask'].shape[0]):
+                    #     print((sft_blocks_inputs.batch['tgt_input_ids'][idx:idx+1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
+                    #     print(sft_blocks_inputs.batch['tgt_attention_mask'][idx:idx+1, prompt_length:].sum())
+                    #     print((sft_blocks_inputs.batch['input_ids'][idx:idx + 1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
+                    #     print(sft_blocks_inputs.batch['attention_mask'][idx:idx+1, prompt_length:].sum())
+                    # print(f' sft blocks input: {sft_blocks_inputs}')
+
+                    with marked_timer("dynamic sft", timing_raw, "red"):
+                        sft_blocks_inputs.meta_info = batch.meta_info
+                        sft_blocks_inputs.meta_info['calculate_rl_loss'] = True
+                        sft_blocks_inputs.meta_info['calculate_sft_loss'] = True
+                        sft_output = self.actor_rollout_wg.update_actor(sft_blocks_inputs)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            print('batch before update actor ', batch)
+                            # print('batch before update actor ', batch)
                             # print(f' need_analyze_gradients: {self.config.trainer.need_analyze_gradients}')
                             # print(f' save  gradients freq: {self.config.trainer.analyze_gradients_freq}')
                             if self.global_steps % self.config.trainer.get('analyze_gradients_freq', 10) == 0:
@@ -565,6 +780,8 @@ class RayMixedTrainer(RayPPOTrainer):
                                     batch.meta_info['need_analyze_off_grads'] = True
                             if self.config.actor_rollout_ref.rollout.n_off_policy > 0:
                                 batch.meta_info['contain_off_policy'] = True
+                            batch.meta_info['calculate_sft_loss'] = self.config.actor_rollout_ref.actor.calculate_sft_loss
+                            batch.meta_info['calculate_rl_loss'] = self.config.actor_rollout_ref.actor.calculate_rl_loss
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -683,7 +900,7 @@ class RayMixedTrainer(RayPPOTrainer):
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
 
-        overall_score = np.mean(reward_tensor.numpy()) / reward_tensor.shape[0]
+        overall_score = np.mean(reward_tensor.numpy())
         print(f'overall average score: {overall_score:.4f}')
         metric_dict = {f'val/overall_score': overall_score,
                        f'val/overall_correct': np.mean(reward_tensor.numpy()),}

@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import torch.distributed
 
-import verl.utils.torch_functional as verl_F
 from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -18,11 +17,7 @@ from verl.utils.device import (
     get_nccl_backend,
 )
 from verl.utils.fs import copy_to_local
-from verl.utils.fsdp_utils import (
-    fsdp_version,
-)
 from verl.utils.import_utils import import_external_libs
-from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import DistProfiler, DistProfilerExtension
 from verl.workers.fsdp_workers import create_device_mesh
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -131,76 +126,12 @@ class AnswersChecker(Worker, DistProfilerExtension):
         import_external_libs(self.config.model.get("external_lib", None))
         self._build_model(config=self.config)
 
-
-    def _switch_chat_template(self, data: DataProto):
-        src_max_length = data.batch["attention_mask"].shape[-1]
-
-        src_tokenizer = self.input_tokenizer
-        target_tokenizer = self.tokenizer
-
-        rm_input_ids = []
-        rm_attention_mask = []
-
-        for i in range(data.batch.batch_size[0]):
-            # extract raw prompt
-            if isinstance(data.non_tensor_batch["raw_prompt"][i], list):
-                chat: list = data.non_tensor_batch["raw_prompt"][i]
-            else:
-                chat: list = data.non_tensor_batch["raw_prompt"][i].tolist()
-
-            # extract response
-            response_ids = data.batch["responses"][i]
-            response_length = response_ids.shape[-1]
-            valid_response_length = data.batch["attention_mask"][i][-response_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            response = src_tokenizer.decode(valid_response_ids)
-            # remove bos and eos
-            response = response.replace(src_tokenizer.eos_token, "")
-
-            chat.append({"role": "assistant", "content": response})
-
-            prompt_with_chat_template = target_tokenizer.apply_chat_template(
-                chat, add_generation_prompt=False, tokenize=False
-            )
-            if self.rank == 0 and i == 0:
-                # for debugging purpose
-                print(f"Switch template. chat: {prompt_with_chat_template}")
-
-            # the maximum length is actually determined by the reward model itself
-            max_length = self.config.get("max_length", src_max_length)
-            if max_length is None:
-                max_length = src_max_length
-
-            model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors="pt", add_special_tokens=False)
-            input_ids, attention_mask = verl_F.postprocess_data(
-                input_ids=model_inputs["input_ids"],
-                attention_mask=model_inputs["attention_mask"],
-                max_length=max_length,
-                pad_token_id=target_tokenizer.pad_token_id,
-                left_pad=False,  # right padding
-                truncation=self.config.get("truncation", "right"),
-            )  # truncate from the right
-
-            rm_input_ids.append(input_ids)
-            rm_attention_mask.append(attention_mask)
-
-        rm_input_ids = torch.cat(rm_input_ids, dim=0)
-        rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
-
-        rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
-
-        rm_inputs = {"input_ids": rm_input_ids, "attention_mask": rm_attention_mask, "position_ids": rm_position_ids}
-
-        return DataProto.from_dict(rm_inputs)
-
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="brown")
     def generate_answers_mask(self, data: DataProto):
         # Support all hardwares
         data = data.to(get_device_id())
-        print(f'data: {data}')
+        # print(f' data: {data}')
 
         responses = data.batch['responses']
         advantages = data.batch['advantages']
@@ -216,7 +147,7 @@ class AnswersChecker(Worker, DistProfilerExtension):
 
         flat_responses = responses.view(-1).tolist()
         flat_tokens = self.tokenizer.convert_ids_to_tokens(flat_responses)
-        flat_tokens = [token.replace("Ġ", " ").replace("Ċ", "\n") for token in flat_tokens]
+        flat_tokens = [token.replace("Ġ", " ").replace("Ċ", "\n") if token is not None else "" for token in flat_tokens]
         tokens = [flat_tokens[i*responses.size(1):(i+1)*response_mask.size(1)] for i in range(responses.size(0))]
         blocks = build_high_entropy_blocks_tensor(tokens, entropys, process_mask*response_mask, seed_method='mean_std',
                                                   max_block_len=16, min_block_len=3, stop_on_sentence_boundary=True)
@@ -229,7 +160,8 @@ class AnswersChecker(Worker, DistProfilerExtension):
         blocks_sum = sum(blocks_length)
         complete_answers = data.non_tensor_batch["raw_tgt_prompts"].tolist()
         input_texts = queries + complete_answers
-        outputs = self.inference_engine.embed(input_texts)
+        print(f"input queries length: {len(input_texts)}")
+        outputs = self.inference_engine.embed(input_texts, use_tqdm=False)
         embeddings = torch.tensor([output.outputs.embedding for output in outputs])
         documents = embeddings[blocks_sum:]
 
