@@ -40,11 +40,11 @@ answers_checker:
   tensor_parallel_size: 2
   dtype: bfloat16
   enforce_eager: True
-  gpu_memory_utilization: 0.8
+  gpu_memory_utilization: 0.5
   load_format: dummy_dtensor
   disable_log_stats: True
-  max_num_batched_tokens: 16384
-  max_model_len: 16384
+  max_num_batched_tokens: 8192
+  max_model_len: 8192
   enable_chunked_prefill: False
   embedding_model:
     enable: True

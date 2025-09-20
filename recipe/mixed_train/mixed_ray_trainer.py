@@ -5,6 +5,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import uuid
 from collections import defaultdict
 from enum import Enum
+from idlelib.rpc import response_queue
 from pprint import pprint
 from typing import Optional
 
@@ -16,6 +17,7 @@ from tensordict import TensorDict
 from torch.utils.data import Sampler
 from tqdm import tqdm
 
+from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor
 from verl import DataProto
 from verl.protocol import unpad_dataproto, pad_dataproto_to_divisor
 from verl.single_controller.ray import RayClassWithInitArgs, create_colocated_worker_cls, RayWorkerGroup
@@ -48,6 +50,11 @@ class Role(Enum):
     ActorRolloutRef = 6
     AnswersChecker = 7
 
+TASK = ('Given a query of a math question and the standard answer, '
+         'conclude whether the query is related to the standard answer.')
+
+def get_detailed_instruct(task_description: str, query: str) -> str:
+    return f'Instruct: {task_description}\nQuery:{query}'
 
 class RayMixedTrainer(RayPPOTrainer):
     """
@@ -261,6 +268,31 @@ class RayMixedTrainer(RayPPOTrainer):
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+    def get_answers_blocks(self, data: DataProto):
+        responses = data.batch['responses']
+        advantages = data.batch['advantages']
+        entropys = data.batch['entropys']
+        response_mask = data.batch['response_mask']
+        process_mask = (advantages < 0).int() * response_mask
+        flat_responses = responses.view(-1).tolist()
+        flat_tokens = self.tokenizer.convert_ids_to_tokens(flat_responses)
+        flat_tokens = [token.replace("Ġ", " ").replace("Ċ", "\n") if token is not None else "" for token in flat_tokens]
+        tokens = [flat_tokens[i * responses.size(1):(i + 1) * response_mask.size(1)] for i in range(responses.size(0))]
+        blocks = build_high_entropy_blocks_tensor(tokens, entropys, process_mask * response_mask, seed_method='mean_std',
+                                                  max_block_len=16, min_block_len=3, stop_on_sentence_boundary=True)
+        data.non_tensor_batch['parsed_blocks'] = np.array(blocks, dtype=object)
+        queries = []
+        blocks_length = []
+        for block_list in blocks:
+            blocks_length.append(len(block_list))
+            query_list = []
+            for block in block_list:
+                query_list.append(get_detailed_instruct(task_description=TASK, query=block.text))
+            queries.append(query_list)
+        data.non_tensor_batch['blocks_length'] = np.array(blocks_length)
+        data.non_tensor_batch['queries'] = np.array(queries, dtype=object)
+        return data
 
     def construct_explain_prompt(self, question: str, standard_answer: str, answer_prefix: str):
         chat = [
@@ -706,17 +738,24 @@ class RayMixedTrainer(RayPPOTrainer):
                     # print(f' non tensors batch keys(): {batch.non_tensor_batch.keys()}')
                     # torch.save(batch.batch, os.path.join('entropy_examples', f'{self.global_steps}.pt'))
 
-                    # TODO: 分块检测相似性
+                    # TODO：在外部处理语义块分割
+                    batch = self.get_answers_blocks(batch)
+                    # print(f'batch with parsed blocks: {batch}')
+
                     batch = self.answers_checker_wg.generate_answers_mask(batch)
+                    print(f'type of batch: {type(batch)}, type of item in batch: {type(batch[0])}')
                     # print(f' batch: {batch.batch}')
 
                     sft_blocks_inputs, incomplete_responses, pad_times, tgt_incomplete_responses = \
                                     self.gather_sft_blocks_input(batch)
+                    print(
+                        f'input: {self.tokenizer.decode(sft_blocks_inputs.batch["input_ids"][0], skip_special_tokens=True)}')
                     sft_inputs_batch = sft_blocks_inputs.pop(
                         batch_keys=["input_ids", "attention_mask"]
                     )
                     # print(f' sft blocks input: {sft_blocks_inputs}')
                     sft_blocks_result = self.actor_rollout_wg.generate_sft_blocks(sft_inputs_batch)
+                    print(f'complete responses: {self.tokenizer.decode(sft_blocks_result.batch["responses"][0], skip_special_tokens=True)}')
                     # print(f'sft_blocks_result: {sft_blocks_result}')
                     pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
                     prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
