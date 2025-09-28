@@ -1,14 +1,11 @@
-import faulthandler
 import logging
 import os
-import signal
 
 import numpy as np
 
 import torch
 import torch.distributed
 
-from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -82,7 +79,7 @@ class AnswersChecker(Worker, DistProfilerExtension):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
             "tensor parallel size should be less than or equal to the world size"
         )
-        import os, sys
+        import os
 
         os.environ["VLLM_USE_V1"] = "0"
 
