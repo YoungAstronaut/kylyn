@@ -37,7 +37,7 @@ from omegaconf import OmegaConf
 from torch import nn
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
@@ -122,7 +122,13 @@ class MegatronPPOActor(BasePPOActor):
         self.tf_config = tf_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
-        self.prof = Profiler(self.config.profile)
+        self.use_torch_profiler = self.config.profiler.get("tool") == "torch"
+        if self.use_torch_profiler:
+            self.prof = Profiler(
+                self.config.profiler, tool_config=self.config.profiler.get("tool_config", {}).get("torch", {})
+            )
+        else:
+            self.prof = None
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
         if self.use_fused_kernels:
             from verl.models.mcore.model_forward_fused import patch_fused_forward
@@ -177,8 +183,6 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
             DataProto: torch.Tensor: the log_prob tensor
         """
-        data.to(get_device_id())
-        data.batch = data.batch.contiguous()
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
         micro_batch_size = data.meta_info.get("micro_batch_size", None)
         max_token_len = data.meta_info.get("max_token_len", None)
@@ -233,7 +237,7 @@ class MegatronPPOActor(BasePPOActor):
                     log_probs = torch.empty(
                         size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
                     )
-
+                log_probs = log_probs.to(get_device_id())
                 # broadcast across pp ranks
                 torch.distributed.broadcast(
                     tensor=log_probs,
@@ -241,6 +245,7 @@ class MegatronPPOActor(BasePPOActor):
                     group=mpu.get_pipeline_model_parallel_group(),
                     async_op=False,
                 )
+                log_probs = log_probs.to("cpu")
                 if calculate_entropy:
                     # Note that o[0] is metrics, o[1] is entropy
                     if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -257,12 +262,14 @@ class MegatronPPOActor(BasePPOActor):
                             size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
                         )
                     # broadcast across pp ranks
+                    entropys = entropys.to(get_device_id())
                     torch.distributed.broadcast(
                         tensor=entropys,
                         src=mpu.get_pipeline_model_parallel_last_rank(),
                         group=mpu.get_pipeline_model_parallel_group(),
                         async_op=False,
                     )
+                    entropys = entropys.to("cpu")
 
         # add empty cache after each compute
         get_torch_device().empty_cache()
@@ -295,7 +302,15 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
 
         """
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys = [
+            "responses",
+            "input_ids",
+            "attention_mask",
+            "response_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages",
+        ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -328,12 +343,15 @@ class MegatronPPOActor(BasePPOActor):
         """
         # broadcast from last pp rank to all other pp ranks
         # TODO: actually, we just need to control the sampling order.
+        data.to(get_device_id())
+        data.batch = data.batch.contiguous()
         mini_batch = data
         broadcast_dict_tensor(
             mini_batch.batch,
             src=mpu.get_pipeline_model_parallel_last_rank(),
             group=mpu.get_pipeline_model_parallel_group(),
         )
+        mini_batch.to("cpu")
         # split into micro-batches
         mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
@@ -349,6 +367,7 @@ class MegatronPPOActor(BasePPOActor):
             ]  # mcore patch recompute qwen2vl's pos ids during forward
 
         indices = None
+        temperature = data.meta_info["temperature"]
         if use_dynamic_bsz:
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -395,8 +414,7 @@ class MegatronPPOActor(BasePPOActor):
 
             responses = data["responses"]
             response_length = responses.size(1)
-            attention_mask = data["attention_mask"].to(bool)
-            response_mask = attention_mask[:, -response_length:]
+            response_mask = data["response_mask"].to(bool)
             loss_agg_mode = self.config.loss_agg_mode
 
             # compute policy loss
@@ -407,39 +425,20 @@ class MegatronPPOActor(BasePPOActor):
                 old_log_prob = data["old_log_probs"]
                 advantages = data["advantages"]
 
-                clip_ratio = self.config.clip_ratio
-                clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-
-                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                 entropy_coeff = self.config.entropy_coeff
                 loss_agg_mode = self.config.loss_agg_mode
 
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-                if self.config.policy_loss.loss_mode == "vanilla":
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
-
-                else:
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                    )
+                policy_loss_fn = get_policy_loss_fn(loss_mode)
+                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    old_log_prob=old_log_prob,
+                    log_prob=log_prob,
+                    advantages=advantages,
+                    response_mask=response_mask,
+                    loss_agg_mode=loss_agg_mode,
+                    config=self.config,
+                )
 
                 stats.update(
                     {
@@ -480,6 +479,9 @@ class MegatronPPOActor(BasePPOActor):
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
+            batch = batch.to(get_device_id())
+            batch = batch.contiguous()
+
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
             position_ids = batch["position_ids"]
@@ -514,6 +516,7 @@ class MegatronPPOActor(BasePPOActor):
                     multi_modal_inputs=multi_modal_inputs,
                     labels=label,
                     labels_mask=label_mask,
+                    temperature=temperature,
                 )
             else:
                 forward_fn = get_mcore_forward_fn(self.hf_config)
@@ -521,11 +524,20 @@ class MegatronPPOActor(BasePPOActor):
                 def logits_processor(logits, label, label_mask):
                     assert logits.shape[:2] == label.shape[:2]
                     assert label.shape == label_mask.shape
+                    logits.div_(temperature)
                     ret = {}
                     if calculate_entropy:
+                        logits_bak = logits.clone()
+                        logger.warning_once(
+                            "For memory-efficient computation, enable fused kernels via "
+                            "`actor_rollout_ref.model.use_fused_kernels=True`. "
+                            "The current `clone()` operation ensures correctness but increases memory usage."
+                        )
                         entropy = vocab_parallel_entropy(logits)
                         ret["entropy"] = entropy
-                    log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+                    else:
+                        logits_bak = logits
+                    log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret["log_probs"] = log_probs
                     return ret
@@ -604,9 +616,9 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
-        self.prof.start()
+        if self.use_torch_profiler and self.prof and self.prof.enable:
+            self.prof.start()
         for data in dataloader:
-            data.to(get_device_id())
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
@@ -643,9 +655,11 @@ class MegatronPPOActor(BasePPOActor):
                 pass
             else:
                 raise NotImplementedError
-            self.prof.step()
+            if self.use_torch_profiler and self.prof and self.prof.enable:
+                self.prof.step()
         # add empty cache after each compute
-        self.prof.stop_and_save()
-        self.prof.stop_trace()
+        if self.use_torch_profiler and self.prof and self.prof.enable:
+            self.prof.stop_and_save()
+            self.prof.stop_trace()
         get_torch_device().empty_cache()
         return metrics

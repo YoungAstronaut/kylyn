@@ -19,10 +19,11 @@ import torch
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
+from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 
 @register("dapo")
-class DAPORewardManager:
+class DAPORewardManager(AbstractRewardManager):
     """The reward manager."""
 
     def __init__(
@@ -106,6 +107,7 @@ class DAPORewardManager:
                     reward_extra_info[key].append(value)
             else:
                 score = result
+                reward_extra_info["acc"].append(score)
 
             reward = score
 
