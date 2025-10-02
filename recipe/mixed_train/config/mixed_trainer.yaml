@@ -61,6 +61,8 @@ algorithm:
 
 actor_rollout_ref:
   rollout:
+    _target_: recipe.mixed_train.mixed_train_config.MixedTrainRolloutConfig
+    name: vllm
     calculate_log_probs: False
     n_off_policy: 1
     self_explain:
@@ -68,9 +70,9 @@ actor_rollout_ref:
       max_blocks_num: 5
     chunk_size: 8
   actor:
+    _target_: recipe.mixed_train.mixed_train_config.MixedTrainActorConfig
     use_off_policy_loss: False
     off_policy_normalize: False
-    off_policy_loss_impl: token
     off_policy_cliprange: 0.2
     use_off_policy_probs: False
     use_off_policy_clip: False

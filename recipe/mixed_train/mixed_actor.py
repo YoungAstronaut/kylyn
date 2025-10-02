@@ -533,6 +533,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         if calculate_rl_loss is None:
             calculate_rl_loss = self.config.calculate_rl_loss
         print(f'calculate_rl_loss: {calculate_rl_loss}')
+
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -564,7 +565,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        dataloader = batch.split(self.config.ppo_mini_batch_size)
+        mini_batches = batch.split(self.config.ppo_mini_batch_size)
 
         # print('ppo mini batch: ', self.config.ppo_mini_batch_size)
         clip_ratio = self.config.clip_ratio
@@ -578,7 +579,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         metrics = {}
         # print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
         for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
+            for batch_idx, data in enumerate(mini_batches):
                 # print(f' data: {data}')
                 responses_length = data[0]["responses"].shape[-1]
                 prompt_length = data[0]["input_ids"].shape[-1] - responses_length

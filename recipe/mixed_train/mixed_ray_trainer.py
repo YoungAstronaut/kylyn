@@ -34,6 +34,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask, ResourcePoolManager, WorkerType,
 )
+from verl.utils import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.torch_functional import pad_sequence_to_length, get_response_mask
@@ -162,7 +163,6 @@ class RayMixedTrainer(RayPPOTrainer):
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
                 role="actor_rollout",
-                profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -171,7 +171,8 @@ class RayMixedTrainer(RayPPOTrainer):
         # create critic
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+            critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
 
         # create reference policy if needed
@@ -181,7 +182,6 @@ class RayMixedTrainer(RayPPOTrainer):
                 self.role_worker_mapping[Role.RefPolicy],
                 config=self.config.actor_rollout_ref,
                 role="ref",
-                profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
@@ -218,22 +218,22 @@ class RayMixedTrainer(RayPPOTrainer):
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
-            assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, (
-                "worker_nsight_options must be set when profile_steps is set"
-            )
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+            ), "worker_nsight_options must be set when profile_steps is set"
             wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                OmegaConf.select(self.config.trainer, "worker_nsight_options")
+                OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
             )
+        wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            print(f'class dict: {class_dict}')
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
                 ray_cls_with_init=worker_dict_cls,
-                device_name=self.device_name,
                 **wg_kwargs,
             )
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
@@ -492,6 +492,13 @@ class RayMixedTrainer(RayPPOTrainer):
         self.global_steps += 1
         last_val_metrics = None
 
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+
         timing_raw = defaultdict(float)
         batch = None
         num_prompt_in_batch = 0
@@ -500,20 +507,12 @@ class RayMixedTrainer(RayPPOTrainer):
             for batch_dict in self.train_dataloader:
                 metrics = {}
 
-                do_profile = (
-                    self.global_steps in self.config.trainer.profile_steps
-                    if self.config.trainer.profile_steps is not None
-                    else False
-                )
                 with marked_timer("start_profile", timing_raw):
-                    if do_profile:
-                        self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
-                        if self.use_reference_policy:
-                            self.ref_policy_wg.start_profile()
-                        if self.use_critic:
-                            self.critic_wg.start_profile()
-                        if self.use_rm:
-                            self.rm_wg.start_profile()
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 # print(f' new batch: {new_batch}')
@@ -738,71 +737,71 @@ class RayMixedTrainer(RayPPOTrainer):
                     # print(f' non tensors batch keys(): {batch.non_tensor_batch.keys()}')
                     # torch.save(batch.batch, os.path.join('entropy_examples', f'{self.global_steps}.pt'))
 
-                    # TODO：在外部处理语义块分割
-                    batch = self.get_answers_blocks(batch)
-                    # print(f'batch with parsed blocks: {batch}')
-
-                    batch = self.answers_checker_wg.generate_answers_mask(batch)
-                    print(f'type of batch: {type(batch)}, type of item in batch: {type(batch[0])}')
-                    # print(f' batch: {batch.batch}')
-
-                    sft_blocks_inputs, incomplete_responses, pad_times, tgt_incomplete_responses = \
-                                    self.gather_sft_blocks_input(batch)
-                    print(
-                        f'input: {self.tokenizer.decode(sft_blocks_inputs.batch["input_ids"][0], skip_special_tokens=True)}')
-                    sft_inputs_batch = sft_blocks_inputs.pop(
-                        batch_keys=["input_ids", "attention_mask"]
-                    )
-                    # print(f' sft blocks input: {sft_blocks_inputs}')
-                    sft_blocks_result = self.actor_rollout_wg.generate_sft_blocks(sft_inputs_batch)
-                    print(f'complete responses: {self.tokenizer.decode(sft_blocks_result.batch["responses"][0], skip_special_tokens=True)}')
-                    # print(f'sft_blocks_result: {sft_blocks_result}')
-                    pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
-                    prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
-
-                    # 用于强化学习的input_ids、attention_mask
-                    sft_blocks_inputs.batch['responses'] = torch.cat(
-                        [pad_sequence_to_length(response, pad_length, self.tokenizer.pad_token_id, left_pad=False)
-                         for response in incomplete_responses], dim=0
-                    )
-                    sft_blocks_inputs.batch['input_ids'] = torch.cat(
-                        [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['responses']], dim=1
-                    )
-                    sft_blocks_inputs.batch['attention_mask'] = torch.cat(
-                        [sft_blocks_inputs.batch['tgt_attention_mask'], sft_blocks_inputs.batch['response_mask']],
-                        dim=-1
-                    )
-
-                    sft_blocks_inputs.batch['tgt_responses'] = torch.cat(
-                        [pad_sequence_to_length(
-                            torch.cat([response, sft_blocks_result.batch['responses'][idx:idx+1,...]], dim=-1),
-                            pad_length, self.tokenizer.pad_token_id, left_pad=False)
-                         for idx, response in enumerate(tgt_incomplete_responses)], dim=0
-                    )
-                    sft_blocks_inputs.batch['tgt_input_ids'] = torch.cat(
-                        [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['tgt_responses']], dim=1
-                    )
-                    pad_tgt_attention_mask = torch.zeros_like(sft_blocks_inputs.batch['response_mask'])
-                    for idx, response in enumerate(tgt_incomplete_responses):
-                        response_length = response.shape[-1]
-                        start = prompt_length+response_length
-                        end = start+sft_blocks_result.batch['responses'].shape[1]
-                        pad_tgt_attention_mask[idx:idx+1, start:end] = 1
-                    sft_blocks_inputs.batch['tgt_attention_mask'] = torch.cat(
-                        [sft_blocks_inputs.batch['tgt_attention_mask'], pad_tgt_attention_mask], dim=-1
-                    )
-                    # for idx in range(sft_blocks_inputs.batch['tgt_attention_mask'].shape[0]):
-                    #     print((sft_blocks_inputs.batch['tgt_input_ids'][idx:idx+1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
-                    #     print(sft_blocks_inputs.batch['tgt_attention_mask'][idx:idx+1, prompt_length:].sum())
-                    #     print((sft_blocks_inputs.batch['input_ids'][idx:idx + 1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
-                    #     print(sft_blocks_inputs.batch['attention_mask'][idx:idx+1, prompt_length:].sum())
-                    # print(f' sft blocks input: {sft_blocks_inputs}')
-
-                    with marked_timer("dynamic sft", timing_raw, "red"):
-                        sft_blocks_inputs.meta_info = batch.meta_info
-                        sft_blocks_inputs.meta_info['calculate_rl_loss'] = True
-                        sft_blocks_inputs.meta_info['calculate_sft_loss'] = True
-                        sft_output = self.actor_rollout_wg.update_actor(sft_blocks_inputs)
+                    # # TODO：在外部处理语义块分割
+                    # batch = self.get_answers_blocks(batch)
+                    # # print(f'batch with parsed blocks: {batch}')
+                    #
+                    # batch = self.answers_checker_wg.generate_answers_mask(batch)
+                    # print(f'type of batch: {type(batch)}, type of item in batch: {type(batch[0])}')
+                    # # print(f' batch: {batch.batch}')
+                    #
+                    # sft_blocks_inputs, incomplete_responses, pad_times, tgt_incomplete_responses = \
+                    #                 self.gather_sft_blocks_input(batch)
+                    # print(
+                    #     f'input: {self.tokenizer.decode(sft_blocks_inputs.batch["input_ids"][0], skip_special_tokens=True)}')
+                    # sft_inputs_batch = sft_blocks_inputs.pop(
+                    #     batch_keys=["input_ids", "attention_mask"]
+                    # )
+                    # # print(f' sft blocks input: {sft_blocks_inputs}')
+                    # sft_blocks_result = self.actor_rollout_wg.generate_sft_blocks(sft_inputs_batch)
+                    # print(f'complete responses: {self.tokenizer.decode(sft_blocks_result.batch["responses"][0], skip_special_tokens=True)}')
+                    # # print(f'sft_blocks_result: {sft_blocks_result}')
+                    # pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
+                    # prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
+                    #
+                    # # 用于强化学习的input_ids、attention_mask
+                    # sft_blocks_inputs.batch['responses'] = torch.cat(
+                    #     [pad_sequence_to_length(response, pad_length, self.tokenizer.pad_token_id, left_pad=False)
+                    #      for response in incomplete_responses], dim=0
+                    # )
+                    # sft_blocks_inputs.batch['input_ids'] = torch.cat(
+                    #     [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['responses']], dim=1
+                    # )
+                    # sft_blocks_inputs.batch['attention_mask'] = torch.cat(
+                    #     [sft_blocks_inputs.batch['tgt_attention_mask'], sft_blocks_inputs.batch['response_mask']],
+                    #     dim=-1
+                    # )
+                    #
+                    # sft_blocks_inputs.batch['tgt_responses'] = torch.cat(
+                    #     [pad_sequence_to_length(
+                    #         torch.cat([response, sft_blocks_result.batch['responses'][idx:idx+1,...]], dim=-1),
+                    #         pad_length, self.tokenizer.pad_token_id, left_pad=False)
+                    #      for idx, response in enumerate(tgt_incomplete_responses)], dim=0
+                    # )
+                    # sft_blocks_inputs.batch['tgt_input_ids'] = torch.cat(
+                    #     [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['tgt_responses']], dim=1
+                    # )
+                    # pad_tgt_attention_mask = torch.zeros_like(sft_blocks_inputs.batch['response_mask'])
+                    # for idx, response in enumerate(tgt_incomplete_responses):
+                    #     response_length = response.shape[-1]
+                    #     start = prompt_length+response_length
+                    #     end = start+sft_blocks_result.batch['responses'].shape[1]
+                    #     pad_tgt_attention_mask[idx:idx+1, start:end] = 1
+                    # sft_blocks_inputs.batch['tgt_attention_mask'] = torch.cat(
+                    #     [sft_blocks_inputs.batch['tgt_attention_mask'], pad_tgt_attention_mask], dim=-1
+                    # )
+                    # # for idx in range(sft_blocks_inputs.batch['tgt_attention_mask'].shape[0]):
+                    # #     print((sft_blocks_inputs.batch['tgt_input_ids'][idx:idx+1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
+                    # #     print(sft_blocks_inputs.batch['tgt_attention_mask'][idx:idx+1, prompt_length:].sum())
+                    # #     print((sft_blocks_inputs.batch['input_ids'][idx:idx + 1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
+                    # #     print(sft_blocks_inputs.batch['attention_mask'][idx:idx+1, prompt_length:].sum())
+                    # # print(f' sft blocks input: {sft_blocks_inputs}')
+                    #
+                    # with marked_timer("dynamic sft", timing_raw, "red"):
+                    #     sft_blocks_inputs.meta_info = batch.meta_info
+                    #     sft_blocks_inputs.meta_info['calculate_rl_loss'] = True
+                    #     sft_blocks_inputs.meta_info['calculate_sft_loss'] = True
+                    #     sft_output = self.actor_rollout_wg.update_actor(sft_blocks_inputs)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -844,14 +843,18 @@ class RayMixedTrainer(RayPPOTrainer):
                             self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
-                    if do_profile:
-                        self.actor_rollout_wg.stop_profile()
-                        if self.use_reference_policy:
-                            self.ref_policy_wg.stop_profile()
-                        if self.use_critic:
-                            self.critic_wg.stop_profile()
-                        if self.use_rm:
-                            self.rm_wg.stop_profile()
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

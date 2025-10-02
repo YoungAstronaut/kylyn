@@ -135,7 +135,6 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.actor.use_off_policy_loss=True \
     actor_rollout_ref.actor.off_policy_normalize=False \
     actor_rollout_ref.actor.off_policy_reshape="p_div_p_0.1" \
-    actor_rollout_ref.actor.off_policy_loss_impl=token \
     actor_rollout_ref.actor.calculate_sft_loss="${calculate_sft_loss}" \
     actor_rollout_ref.actor.sft_loss_coef="${sft_coef}" \
     actor_rollout_ref.actor.calculate_rl_loss="${calculate_rl_loss}" \
