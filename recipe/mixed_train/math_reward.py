@@ -173,11 +173,14 @@ class RuleBasedRewardManager():
                 else:
                     raise NotImplementedError(f'Un recognized result type: {type(result)}')
                 # print('solution str: ', solution_str)
-                reward_tensor[i, valid_response_length - 1] = score
+            # print('valid response length: ', valid_response_length)
+            reward_tensor[i, valid_response_length - 1] = score
+            # print(f'sum: {reward_tensor[i].sum()}')
             # print('ground truth: ', ground_truth)
             # print('score: ', score)
 
             reward_extra_info['acc'].append(score == 1.0)
+            reward_extra_info['data_source'].append(data_source)
             
             # 进行回答长度过长惩罚
             # if self.overlong_buffer_cfg.enable:
