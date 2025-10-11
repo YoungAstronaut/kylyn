@@ -30,6 +30,7 @@ from tensordict import TensorDict
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
@@ -117,13 +118,16 @@ def shape_on_policy(shape_strategy: str,
         raise ValueError(f"Invalid on_policy_reshape: {shape_strategy}")
 
 def shape_off_policy(shape_strategy: str,
-                     old_log_prob: Tensor,
                      log_prob: Tensor,
                      policy_reshape_weight: float = 1.0,
                      policy_reshape_pow_exp: float = 0.5,
                      eps: float = 1e-8):
     # 这里不是严格 ratio，更多是“提升该 token 概率”的系数
     off_ratio = torch.exp(log_prob)  # (0, 1]
+    off_frac_min_before = torch.min(off_ratio, dim=-1).values
+    off_frac_max_before = torch.max(off_ratio, dim=-1).values
+    off_frac_mean_before = torch.mean(off_ratio)
+    off_frac_std_before = torch.std(off_ratio)
     if shape_strategy == "no_reshape":
         pass
     elif shape_strategy == "logp":
@@ -142,7 +146,21 @@ def shape_off_policy(shape_strategy: str,
         off_ratio = torch.pow(off_ratio, policy_reshape_pow_exp)
     else:
         raise ValueError(f"Invalid off_policy_reshape: {shape_strategy}")
-    return off_ratio  # ← 必须返回
+    off_frac_min_after = torch.min(off_ratio, dim=-1).values
+    off_frac_max_after = torch.max(off_ratio, dim=-1).values
+    off_frac_mean_after = torch.mean(off_ratio, dim=-1)
+    off_frac_std_after = torch.std(off_ratio, dim=-1)
+    stats = {
+        "off_frac_min_before": off_frac_min_before.mean(),
+        "off_frac_max_before": off_frac_max_before.mean(),
+        "off_frac_mean_before": off_frac_mean_before.mean(),
+        "off_frac_std_before": off_frac_std_before.mean(),
+        "off_frac_min_after": off_frac_min_after.mean(),
+        "off_frac_max_after": off_frac_max_after.mean(),
+        "off_frac_mean_after": off_frac_mean_after.mean(),
+        "off_frac_std_after": off_frac_std_after.mean(),
+    }
+    return off_ratio, stats  # ← 必须返回
 
 def compute_token_mixed_policy_loss(
     old_log_prob,
@@ -161,7 +179,7 @@ def compute_token_mixed_policy_loss(
     off_max_clip=None,
     off_min_clip=None,
     all_max_clip=None,
-    loss_remove_token_mean=False,
+    loss_agg_mode='token-mean',
     loss_remove_clip=False,
 ):
     # 1) 形状与基本检查
@@ -169,6 +187,7 @@ def compute_token_mixed_policy_loss(
     assert log_prob.shape == advantages.shape,   f'log_prob shape {log_prob.shape} != advantages shape {advantages.shape}'
     assert log_prob.shape == eos_mask.shape,     f'log_prob shape {log_prob.shape} != eos_mask shape {eos_mask.shape}'
 
+    # print(f'shape of log_prob {log_prob.shape}')
     # 统一设备/类型的零
     def _zero_like_scalar(x: Tensor):
         return x.new_zeros(())
@@ -215,8 +234,8 @@ def compute_token_mixed_policy_loss(
 
     # 4) off-policy（如果有）
     if has_on_mask:
-        off_ratio = shape_off_policy(
-            off_policy_reshape, old_log_prob, log_prob,
+        off_ratio, stats = shape_off_policy(
+            off_policy_reshape, log_prob,
             policy_reshape_weight=off_policy_reshape_weight,
             policy_reshape_pow_exp=off_policy_reshape_pow_exp
         )
@@ -234,31 +253,38 @@ def compute_token_mixed_policy_loss(
     else:
         off_pg_loss = _zero_like_scalar(log_prob)
         pg_losses = on_pg_losses
+        stats = None
 
     # 5) 总 loss 的归一化
-    if loss_remove_token_mean:
-        # 只按 batch 平均（去掉 token 级平均）
-        batch_size = log_prob.size(0)
-        pg_loss = (pg_losses * eos_mask).sum() / max(batch_size, 1)
-    else:
-        # 标准 masked mean
-        pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=eos_mask, loss_agg_mode=loss_agg_mode)
 
-    return pg_loss, on_pg_loss, on_pg_clipfrac, off_pg_loss, ppo_kl
+    stats["off_pg_loss"] = off_pg_loss
+    return pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl, stats
 
-    # return {
-    #     "pg_loss": pg_loss,
-    #     "off_pg_loss": off_pg_loss,
-    #     "on_pg_loss": on_pg_loss,
-    #     "off_pg_clipfrac": off_pg_clipfrac,
-    #     "on_pg_clipfrac": on_pg_clipfrac,
-    #     "ppo_kl": ppo_kl,
-    #     "off_policy_prob": off_policy_prob,
-    #     "on_policy_prob": on_policy_prob,
-    #     "off_ratio_mean": off_ratio_mean,
-    #     "off_ratio_max_clip_frac": off_ratio_max_clip_frac,
-    #     "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
-    # }
+def prepare_dynamic_batch_with_targets(data: DataProto, max_token_len: int,
+                                       with_sft: bool=False, with_rl: bool=True) -> tuple[list[DataProto], list[list[int]]]:
+    """
+    Prepare a batch for dynamic batching.
+
+    Args:
+        data (DataProto): The input data.
+        max_token_len (int): The maximum token length for dynamic batching.
+        with_sft:
+        with_rl:
+
+    Returns:
+        Tuple[List[DataProto], List[List[int]]]: A tuple containing a list of DataProto objects
+        and a list of index lists.
+    """
+    batch, batch_idx_list = rearrange_micro_batches_with_targets(data.batch, max_token_len=max_token_len,
+                                                                 with_sft=with_sft, with_rl=with_rl)
+    micro_batches = []
+    for i, batch_idx in enumerate(batch_idx_list):
+        tensors = dict(batch[i])
+        non_tensors = {key: value[batch_idx] for key, value in data.non_tensor_batch.items()}
+        micro_batches.append(DataProto.from_dict(tensors, non_tensors))
+
+    return micro_batches, batch_idx_list
 
 def rearrange_micro_batches_with_targets(
     batch,
@@ -301,7 +327,7 @@ def rearrange_micro_batches_with_targets(
     else:
         raise ValueError("with_sft and with_rl cannot be both False")
     total_seqlen = seq_len_effective.sum().item()
-    print(f'total seq len {total_seqlen}')
+    # print(f'total seq len {total_seqlen}')
     # print(f'seq_len_effective: {seq_len_effective}')
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
@@ -331,25 +357,6 @@ def rearrange_micro_batches_with_targets(
         micro_batches.append(curr_micro_batch)
 
     return micro_batches, micro_bsz_idx
-
-def convert_data(data):
-    if isinstance(data, DataProto):
-        result = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
-    elif isinstance(data, dict):
-        result = {}
-        for k, v in data.items():
-            if isinstance(v, torch.Tensor):
-                result[k] = v.to(get_device_id())
-            elif k == "multi_modal_inputs" and v is not None:
-                result[k] = [
-                    {kk: vv.to(get_device_id()) for kk, vv in item_dict.items()} for item_dict in v
-                ]
-            else:
-                result[k] = v
-    else:
-        result = data.to(get_device_id())  # actor device is cpu when using offload
-    return result
-
 
 def _sanitize_name(name: str) -> str:
     # 便于作为文件名（尽量短）
@@ -549,14 +556,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             "advantages",
             "tgt_input_ids",
             "tgt_attention_mask",
-            "tgt_responses"
+            "tgt_responses",
+            "on_policy_mask"
         ]
         if contain_off_policy:
             select_keys.append('on_policy_mask')
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         select_data = data.select(batch_keys=select_keys)
-        batch = select_data.batch
         non_tensor_batch = select_data.non_tensor_batch
         # print(f' non tensors batch keys: {non_tensor_batch.keys()}')
         # for k, v in batch.items():
@@ -565,7 +572,14 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = batch.split(self.config.ppo_mini_batch_size)
+        print(f'ppo mini batch size: {self.config.ppo_mini_batch_size}')
+        mini_batches = select_data.split(self.config.ppo_mini_batch_size)
+
+        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        if on_policy:
+            print('num of mini batches is 1')
+        else:
+            print('num of mini batches: ', len(mini_batches))
 
         # print('ppo mini batch: ', self.config.ppo_mini_batch_size)
         clip_ratio = self.config.clip_ratio
@@ -576,17 +590,19 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
         )
         clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+
         metrics = {}
         # print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
-        for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(mini_batches):
+        for _ in range(self.config.ppo_epochs):
+            for batch_idx, mini_batch in enumerate(mini_batches):
                 # print(f' data: {data}')
-                responses_length = data[0]["responses"].shape[-1]
-                prompt_length = data[0]["input_ids"].shape[-1] - responses_length
+                responses_length = mini_batch.batch["responses"].shape[-1]
+                prompt_length = mini_batch.batch["input_ids"].shape[-1] - responses_length
 
+                # TODO: 重新看看这一部分分析SFT和RL梯度的内容
                 if need_analyze_sft_grads:
                     out_dir = self.config.get("analyze_dump_dir", "./grad_dumps/on_pg_sft")
-                    sft_batch_data = data[0:1].clone()
+                    sft_batch_data = mini_batch[0:1].clone()
                     sft_batch_data = TensorDict(
                         {'input_ids': sft_batch_data["tgt_input_ids"],
                          'attention_mask': sft_batch_data["tgt_attention_mask"],
@@ -599,7 +615,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                             save_cpu_dtype=torch.float16, per_param_files=True, save_optimizer_state=False,
                             step=step_index, mini_batch_idx=batch_idx)
 
-                    rl_batch_data = data[0:1].clone()
+                    rl_batch_data = mini_batch[0:1].clone()
                     rl_batch_data = TensorDict(
                         {'input_ids': rl_batch_data["input_ids"],
                          'attention_mask': rl_batch_data["attention_mask"],
@@ -618,10 +634,11 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     # mini_batch_metrics = self.analyze_grads(grads_sft, grads_pg)
                     del sft_batch_data, rl_batch_data
 
+                # TODO: 重新看看这一部分分析online RL和offline RL梯度的内容
                 if need_analyze_off_grads:
                     out_dir = self.config.get("analyze_dump_dir", "./grad_dumps/off_on_pg")
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    test_data = data.clone()
+                    test_data = mini_batch.clone()
                     on_pg_batch_data, off_pg_batch_data = split_on_policy_batch(test_data)
                     on_pg_batch_data = TensorDict(
                         {'input_ids': on_pg_batch_data["input_ids"],
@@ -669,13 +686,12 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                                 on_policy_mask=torch.zeros_like(off_pg_batch_data_split['response_mask']))
 
                 # split batch into micro_batches
-                mini_batch = data
                 # print('mini batch: ', mini_batch)
                 if self.config.use_dynamic_bsz:
                     # print('ppo_max_token_len_per_gpu: ', self.config.ppo_max_token_len_per_gpu)
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches_with_targets(
-                        batch=mini_batch, max_token_len=max_token_len,
+                    micro_batches, _ = prepare_dynamic_batch_with_targets(
+                        data=mini_batch, max_token_len=max_token_len,
                         with_sft=calculate_sft_loss, with_rl=calculate_rl_loss)
                 else:
                     self.gradient_accumulation = (
@@ -686,70 +702,87 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                micro_batches = [convert_data(batch) for batch in micro_batches]
-
                 mini_batch_metrics = {}
 
-                for index, data in enumerate(micro_batches):
+                for index, micro_batch in enumerate(micro_batches):
                     micro_batch_metrics = {}
                     # print(f'micro batch data: {data}')
+                    micro_batch = micro_batch.to(get_device_id())
+                    batch_size = micro_batch.batch.batch_size
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    response_mask = model_inputs["response_mask"]
+                    entropy_coeff = self.config.entropy_coeff
+                    loss_agg_mode = self.config.loss_agg_mode
+
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1 / self.gradient_accumulation
 
                     if calculate_sft_loss and calculate_rl_loss:
                         forward_batch_data = TensorDict(
-                            {'input_ids': torch.cat([data["input_ids"], data["tgt_input_ids"]], dim=0),
-                            'attention_mask': torch.cat([data["attention_mask"], data["tgt_attention_mask"]], dim=0),
-                            'position_ids': torch.cat([data["position_ids"], data["position_ids"]], dim=0),
-                            'responses': torch.cat([data["responses"], data["tgt_responses"]], dim=0),
-                            'old_log_probs': torch.cat([data["old_log_probs"], data["old_log_probs"]], dim=0),
-                            'advantages': torch.cat([data["advantages"], data["advantages"]], dim=0),},
-                            batch_size=data.batch_size[0]*2,
+                            {'input_ids': torch.cat([model_inputs["input_ids"], model_inputs["tgt_input_ids"]], dim=0),
+                            'attention_mask': torch.cat([model_inputs["attention_mask"], model_inputs["tgt_attention_mask"]], dim=0),
+                            'position_ids': torch.cat([model_inputs["position_ids"], model_inputs["position_ids"]], dim=0),
+                            'responses': torch.cat([model_inputs["responses"], model_inputs["tgt_responses"]], dim=0),
+                            'old_log_probs': torch.cat([model_inputs["old_log_probs"], model_inputs["old_log_probs"]], dim=0),
+                            'advantages': torch.cat([model_inputs["advantages"], model_inputs["advantages"]], dim=0),},
+                            batch_size=batch_size*2,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
                         forward_batch_data['policy_mask'] = torch.cat(
-                            [torch.ones_like(data["response_mask"]), torch.zeros_like(data["response_mask"])], dim=0).bool()
-                        old_log_prob = forward_batch_data["old_log_probs"]
+                            [torch.ones_like(model_inputs["response_mask"]), torch.zeros_like(model_inputs["response_mask"])], dim=0).bool()
+                        forward_batch_data['on_policy_mask'] = torch.cat(
+                            [torch.ones_like(model_inputs["on_policy_mask"]), torch.zeros_like(model_inputs["response_mask"])], dim=0).bool()
                         advantages = forward_batch_data["advantages"]
                     elif not calculate_sft_loss and calculate_rl_loss:
+                        # print('only rl loss')
                         forward_batch_data = TensorDict(
-                            {'input_ids': data["input_ids"],
-                            'attention_mask': data["attention_mask"],
-                            'position_ids': data["position_ids"],
-                            'responses': data["responses"],
-                            'old_log_probs': data["old_log_probs"],
-                            'advantages': data["advantages"],},
-                            batch_size=data.batch_size,
+                            {'input_ids': model_inputs["input_ids"],
+                            'attention_mask': model_inputs["attention_mask"],
+                            'position_ids': model_inputs["position_ids"],
+                            'responses': model_inputs["responses"],
+                            'old_log_probs': model_inputs["old_log_probs"],
+                            'advantages': model_inputs["advantages"],
+                            'on_policy_mask': model_inputs["on_policy_mask"],},
+                            batch_size=batch_size,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        forward_batch_data['policy_mask'] = torch.ones_like(data["response_mask"]).bool()
-                        if contain_off_policy:
-                            forward_batch_data['on_policy_mask'] = data["on_policy_mask"]
-                            # print(f'forward data {forward_batch_data}')
-                            forward_batch_data, _ = split_on_policy_batch(forward_batch_data)
-                            if forward_batch_data is None:
-                                continue
-                            # print(f'filtered on policy batch {forward_batch_data}')
-                        old_log_prob = forward_batch_data["old_log_probs"]
+                        forward_batch_data['policy_mask'] = torch.ones_like(model_inputs["response_mask"]).bool()
                         advantages = forward_batch_data["advantages"]
                     elif calculate_sft_loss and not calculate_rl_loss:
-                        # 这个分支目前不会跑到
-                        forward_batch_data = TensorDict(
-                            {'input_ids': data["tgt_input_ids"],
-                            'attention_mask': data["tgt_attention_mask"],
-                            'position_ids': data["position_ids"],
-                            'responses': data["tgt_responses"],},
-                            batch_size=data.batch_size,
-                        )
-                        forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        forward_batch_data['policy_mask'] = torch.zeros_like(data["tgt_responses"]).bool()
+                        raise NotImplementedError
+                        # # 这个分支目前不会跑到
+                        # forward_batch_data = TensorDict(
+                        #     {'input_ids': data["tgt_input_ids"],
+                        #     'attention_mask': data["tgt_attention_mask"],
+                        #     'position_ids': data["position_ids"],
+                        #     'responses': data["tgt_responses"],},
+                        #     batch_size=data.batch_size,
+                        # )
+                        # forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
+                        # forward_batch_data['policy_mask'] = torch.zeros_like(data["tgt_responses"]).bool()
                     else:
                         raise ValueError('both sft loss and rl loss are not calculated')
+
                     response_mask = forward_batch_data["response_mask"]
+                    on_policy_mask = forward_batch_data["on_policy_mask"]
+                    # all return: (bsz, response_length)
+
+                    calculate_entropy = False
+                    if entropy_coeff != 0:
+                        calculate_entropy = True
 
                     # print(f' forward batch data: {forward_batch_data}')
                     # all return: (bsz, response_length)
                     entropy, all_log_prob = self._forward_micro_batch(
-                        micro_batch=forward_batch_data, temperature=temperature
+                        micro_batch=forward_batch_data, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+
+                    if on_policy:
+                        old_log_prob = all_log_prob.detach()
+                    else:
+                        old_log_prob = model_inputs["old_log_probs"]
 
                     if calculate_sft_loss:
                         policy_mask = forward_batch_data['policy_mask']
@@ -760,29 +793,40 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                     if calculate_rl_loss:
                         policy_mask = forward_batch_data['policy_mask']
-                        pg_loss, on_pg_loss, on_pg_clipfrac, off_pg_loss, ppo_kl = compute_token_mixed_policy_loss(
-                            old_log_prob=old_log_prob[policy_mask],
-                            log_prob=all_log_prob[policy_mask],
-                            advantages=advantages[policy_mask],
-                            eos_mask=response_mask[policy_mask],
+                        pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl, stats = compute_token_mixed_policy_loss(
+                            old_log_prob=old_log_prob*policy_mask,
+                            log_prob=all_log_prob*policy_mask,
+                            advantages=advantages*policy_mask,
+                            eos_mask=response_mask*policy_mask,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
                             off_max_clip=self.config.off_policy_max_clip if self.config.off_policy_max_clip != -1 else None,
                             off_min_clip=self.config.off_policy_min_clip if self.config.off_policy_min_clip != -1 else None,
                             all_max_clip=self.config.all_max_clip if self.config.all_max_clip != -1 else None,
+                            on_policy_mask=on_policy_mask*policy_mask,
                             on_policy_reshape=self.config.on_policy_reshape,
                             on_policy_reshape_weight=self.config.on_policy_reshape_weight,
                             on_policy_reshape_pow_exp=self.config.on_policy_reshape_pow_exp,
                             off_policy_reshape=self.config.off_policy_reshape,
                             off_policy_reshape_weight=self.config.off_policy_reshape_weight,
                             off_policy_reshape_pow_exp=self.config.off_policy_reshape_pow_exp,
-                            loss_remove_token_mean=self.config.loss_remove_token_mean,
+                            loss_agg_mode=loss_agg_mode,
                             loss_remove_clip=self.config.loss_remove_clip
                         )
-                        # print('pg loss: ', pg_loss, ' pg_loss.shape: ', pg_loss.shape)
+                        # print('on pg loss: ', on_pg_loss, ' off pg loss: ', off_pg_loss)
                         data = {
                             'actor/on_pg_loss': on_pg_loss.detach().item(),
                             'actor/on_pg_clipfrac': on_pg_clipfrac.detach().item(),
+                            'actor/ppo_kl': ppo_kl.detach().item(),
+                            'actor/off_pg_loss': stats['off_pg_loss'].detach().item(),
+                            'actor/off_frac_min_before': stats['off_frac_min_before'].detach().item(),
+                            'actor/off_frac_min_after': stats['off_frac_min_after'].detach().item(),
+                            'actor/off_frac_max_before': stats['off_frac_max_before'].detach().item(),
+                            'actor/off_frac_max_after': stats['off_frac_max_after'].detach().item(),
+                            'actor/off_frac_mean_before': stats['off_frac_mean_before'].detach().item(),
+                            'actor/off_frac_mean_after': stats['off_frac_mean_after'].detach().item(),
+                            'actor/off_frac_std_before': stats['off_frac_std_before'].detach().item(),
+                            'actor/off_frac_std_after': stats['off_frac_std_after'].detach().item(),
                         }
                         append_to_dict(metrics, data)
                     else:
@@ -804,12 +848,18 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     else:
                         raise ValueError('both sft loss and rl loss are not calculated')
 
+                    if entropy_coeff != 0:
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                        # compute policy loss
+                        all_loss = all_loss - entropy_loss * entropy_coeff
+
                     # print(f'all loss: {all_loss}')
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = all_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        loss = all_loss * loss_scale_factor
                     else:
-                        loss = all_loss / self.gradient_accumulation
+                        loss = all_loss * loss_scale_factor
                     loss.backward()
 
                     if calculate_sft_loss:
@@ -819,8 +869,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     if calculate_rl_loss:
                         micro_batch_metrics.update(
                             {
-                                "actor/pg_loss": pg_loss.detach().item(),
-                                "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
                             }
                         )
 
