@@ -129,6 +129,7 @@ logs
 log
 outputs
 .history
+self_explain_examples
 
 # grad
 grad_dumps

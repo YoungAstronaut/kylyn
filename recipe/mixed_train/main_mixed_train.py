@@ -14,7 +14,6 @@ from verl.utils.device import is_cuda_available
 
 from .mixed_ray_trainer import RayMixedTrainer, Role
 
-
 @hydra.main(config_path="config", config_name="mixed_trainer", version_base=None)
 def main(config):
     run_ppo(config)

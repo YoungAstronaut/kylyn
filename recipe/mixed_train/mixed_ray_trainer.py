@@ -2,6 +2,7 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
+import json
 import uuid
 from collections import defaultdict
 from enum import Enum
@@ -13,11 +14,15 @@ import numpy as np
 import torch
 from datasets import Dataset
 from omegaconf import OmegaConf
+from openai import OpenAI
 from tensordict import TensorDict
 from torch.utils.data import Sampler
+import torch.nn.functional as F
 from tqdm import tqdm
 
-from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor
+from recipe.mixed_train.answers_checker import np_split_by_sizes
+from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor, Block
+from recipe.mixed_train.tensor_utils import print_tensor_dict, print_tensor
 from verl import DataProto
 from verl.protocol import unpad_dataproto, pad_dataproto_to_divisor
 from verl.single_controller.ray import RayClassWithInitArgs, create_colocated_worker_cls, RayWorkerGroup
@@ -40,6 +45,17 @@ from verl.utils.profiler import marked_timer
 from verl.utils.torch_functional import pad_sequence_to_length, get_response_mask
 from verl.utils.tracking import ValidationGenerationsLogger
 
+def pad_sequence_to_length_with_trunc(tensors, max_seq_len, pad_token_id, left_pad=False):
+    """
+    pad a 2D tensors (e.g. responses, logprobs) in the last dim to max_seq_length.
+    input shape: [bs, seq_length]
+    output shape: [bs, max_seq_length]
+    """
+    if tensors.shape[-1] >= max_seq_len:
+        return tensors[:, :max_seq_len]
+    # (0, max_seq_len - tensors.shape[-1]) means right pad to max_seq_length and no left pad
+    pad_tuple = (max_seq_len - tensors.shape[-1], 0) if left_pad else (0, max_seq_len - tensors.shape[-1])
+    return F.pad(tensors, pad_tuple, "constant", pad_token_id)
 
 class Role(Enum):
     Actor = 0
@@ -51,11 +67,104 @@ class Role(Enum):
     ActorRolloutRef = 6
     AnswersChecker = 7
 
-TASK = ('Given a query of a math question and the standard answer, '
-         'conclude whether the query is related to the standard answer.')
+TASK = ('Given a partial step from a math solution, '
+        'retrieve the passages from the official solution that this step logically matches; '
+        'focus on mathematical equivalence, shared variables/constants, and transformations, '
+        'and ignore phrasing or order differences.')
 
 def get_detailed_instruct(task_description: str, query: str) -> str:
-    return f'Instruct: {task_description}\nQuery:{query}'
+    return f'Instruct: {task_description}\nQuery: "{query}"'
+
+def get_embeddings_via_server(texts, base_url="http://127.0.0.1:8005/v1",
+                              model_name="qwen3-embed-4b", api_key="secret-embed-key"):
+    """
+    texts: List[str]
+    返回: torch.FloatTensor [N, D]
+    """
+    client = OpenAI(base_url=base_url, api_key=api_key)  # OpenAI 兼容
+    resp = client.embeddings.create(model=model_name, input=texts)
+    embs = [item.embedding for item in resp.data]
+    return torch.tensor(embs, dtype=torch.float32)
+
+
+def generate_answers_mask(queries: list[object], blocks_length: list[int], blocks: list[Block],
+                          complete_answers: list[str]):
+    queries_all = []
+    for item in queries:
+        queries_all += item
+    # print(f' queries all: {queries_all}')
+    # print(f'complete answers: {complete_answers}')
+    input_texts = queries_all + complete_answers
+    embeddings = get_embeddings_via_server(input_texts, base_url="http://127.0.0.1:8005/v1",
+         model_name="qwen3-embed-4b",
+         api_key="secret-embed-key")
+    blocks_sum = sum(blocks_length)
+    documents = embeddings[blocks_sum:]
+
+    filtered_sum = 0
+    filtered_blocks = []
+    # print(f'blocks length: {blocks_length}, blocks sum: {blocks_sum}')
+    embeddings_splits = embeddings[:blocks_sum].split(blocks_length, dim=0)
+    queries_all = np.array(queries_all)
+    input_texts_splits = np_split_by_sizes(queries_all, blocks_length)
+    assert len(embeddings_splits) == len(blocks), f'{len(embeddings_splits)} != {len(blocks)}'
+    assert len(embeddings_splits) == len(blocks_length), f'{len(embeddings_splits)} != {len(blocks_length)}'
+    assert len(input_texts_splits) == len(blocks_length), f'{len(embeddings_splits)} != {len(input_texts_splits)}'
+
+    for idx, embeddings_split in enumerate(embeddings_splits):
+        block_out = []
+        if blocks_length[idx] == 0:
+            filtered_blocks.append([])
+            continue
+        scores = embeddings_split @ documents[idx:idx + 1].T
+        # print('shape of scores: ', scores.shape)
+        # filtered_scores_index = (scores > self.config.similarity_threshold).nonzero(as_tuple=True)[0].tolist()
+        filtered_scores_index = (scores < 0.5).nonzero(as_tuple=True)[0].tolist()
+
+        filtered_sum += len(filtered_scores_index)
+        # print(f'filtered scores index: {filtered_scores_index}, length: {len(filtered_scores_index)}')
+
+        for filter_idx in filtered_scores_index:
+            start = blocks[idx][filter_idx].start
+            end = blocks[idx][filter_idx].end
+            print(input_texts_splits[idx][filter_idx].split('Query: ')[-1], f'score: {scores[filter_idx, 0]:.4f}')
+            block_out.append([start, end])
+        # print(block_out)
+        filtered_blocks.append(block_out)
+
+    assert len(filtered_blocks) == len(blocks_length), f'{len(filtered_blocks)} != {len(blocks_length)}'
+    filtered_ratio = filtered_sum / blocks_sum
+    print(f' filtered ratio: {filtered_ratio}')
+
+    return filtered_blocks
+
+
+def construct_explain_prompt(question: str, standard_answer: str, answer_prefix: str):
+    chat = [
+        {
+            "content": f"Your task is to understand a given standard problem solving process of a given question, "
+                       f"then finish an incomplete reasoning process. The question is :\n\"{question}\"\n The standard "
+                       f"solving process is as followings: \n\"{standard_answer}\"\n",
+            "role": "system"
+        },
+        {
+            "content": f"**Finish the following incomplete answer**: \n{answer_prefix}",
+            "role": "user"
+        }
+    ]
+    # custom_tmpl = """{%- for m in messages -%}
+    # {{ m['content'] }}
+    #
+    # {%- endfor -%}"""
+    #
+    # result = self.tokenizer.apply_chat_template(chat, add_generation_prompt=False, tokenize=False,
+    #                                             chat_template=custom_tmpl)
+    # print(chat)
+    result = chat[0]["content"]+" User: "+chat[1]["content"]
+    # k = result.replace('\n', '&&')
+    # print(f' explain prompt: {k}')
+    return result
+
 
 class RayMixedTrainer(RayPPOTrainer):
     """
@@ -275,10 +384,13 @@ class RayMixedTrainer(RayPPOTrainer):
         entropys = data.batch['entropys']
         response_mask = data.batch['response_mask']
         process_mask = (advantages < 0).int() * response_mask
+        # print(f' valid tokens num of process mask: {process_mask.sum()}')
         flat_responses = responses.view(-1).tolist()
         flat_tokens = self.tokenizer.convert_ids_to_tokens(flat_responses)
         flat_tokens = [token.replace("Ġ", " ").replace("Ċ", "\n") if token is not None else "" for token in flat_tokens]
-        tokens = [flat_tokens[i * responses.size(1):(i + 1) * response_mask.size(1)] for i in range(responses.size(0))]
+        sentence_length = responses.shape[-1]
+        batch_size = responses.shape[0]
+        tokens = [flat_tokens[i * sentence_length:(i + 1) * sentence_length] for i in range(batch_size)]
         blocks = build_high_entropy_blocks_tensor(tokens, entropys, process_mask * response_mask, seed_method='mean_std',
                                                   max_block_len=16, min_block_len=3, stop_on_sentence_boundary=True)
         data.non_tensor_batch['parsed_blocks'] = np.array(blocks, dtype=object)
@@ -288,41 +400,28 @@ class RayMixedTrainer(RayPPOTrainer):
             blocks_length.append(len(block_list))
             query_list = []
             for block in block_list:
+                # print(get_detailed_instruct(task_description=TASK, query=block.text))
                 query_list.append(get_detailed_instruct(task_description=TASK, query=block.text))
             queries.append(query_list)
         data.non_tensor_batch['blocks_length'] = np.array(blocks_length)
         data.non_tensor_batch['queries'] = np.array(queries, dtype=object)
         return data
 
-    def construct_explain_prompt(self, question: str, standard_answer: str, answer_prefix: str):
-        chat = [
-            {
-                "content": f"Your task is to understand a given standard problem solving process of a given question, "
-                           f"then finish an incomplete reasoning process. The question is {question} The standard "
-                           f"solving process is as followings: \n{standard_answer}",
-                "role": "system"
-            },
-            {
-                "content": f"Finish the following incomplete answer: \n{answer_prefix}",
-                "role": "user"
-            }
-        ]
-        return self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
-
-    def gather_sft_blocks_input(self, prompts: DataProto):
-        prompts_ids = prompts.batch["prompts"]
-        position_ids = prompts.batch["position_ids"]
-        advantages = prompts.batch["advantages"]
-        old_log_probs = prompts.batch["old_log_probs"]
-        raw_target_prompts = prompts.non_tensor_batch["raw_tgt_prompts"]
+    def gather_sft_blocks_input(self, data: DataProto, filtered_blocks):
+        prompts_ids = data.batch["prompts"]
+        position_ids = data.batch["position_ids"]
+        advantages = data.batch["advantages"]
+        old_log_probs = data.batch["old_log_probs"]
+        raw_target_prompts = data.non_tensor_batch["raw_tgt_prompts"]
         decoded_questions = self.tokenizer.batch_decode(prompts_ids, skip_special_tokens=True)
-        print(f'sampled questions: {decoded_questions[0]}')
-        decoded_questions = [question.split('User:')[1].split('Assistant:')[0] for question in decoded_questions]
-        print(f'sampled questions: {decoded_questions[0]}')
+        # print(f'sampled questions: {decoded_questions[0]}')
+        decoded_questions = [question.split('User: This is the problem:')[1].split('Assistant:')[0] for question in decoded_questions]
+        # print(f'sampled questions:')
+        # for question in decoded_questions[:10]:
+        #     print(question.replace('\n', ' '))
 
-        responses = prompts.batch["responses"]
-        filtered_blocks = prompts.non_tensor_batch["filtered_blocks"]
-        batch_size = prompts.batch.batch_size[0]
+        responses = data.batch["responses"]
+        batch_size = data.batch.batch_size[0]
         total_nums = prompts_ids.shape[0]
         print(f'total_nums: {total_nums}')
 
@@ -340,22 +439,20 @@ class RayMixedTrainer(RayPPOTrainer):
         for i in range(batch_size):
             if len(filtered_blocks[i]) == 0:
                 continue
-            blocks_per_question = filtered_blocks[i] if len(filtered_blocks[i]) < max_blocks_num \
-                else filtered_blocks[i][:max_blocks_num]
+            # blocks_per_question = filtered_blocks[i] if len(filtered_blocks[i]) < max_blocks_num \
+            #     else filtered_blocks[i][:max_blocks_num]
+            blocks_per_question = filtered_blocks[i]
             for block in blocks_per_question:
                 start = block[0]
                 if start == 0:
                     continue
                 end = block[1]
-                # print(f'start: {start}, end: {end}')
                 new_responses.append(responses[i:i+1,:end])
                 new_responses_mask_item = torch.zeros_like(responses[i:i+1,...])
                 new_responses_mask_item[...,start:end] = 1
                 new_responses_mask.append(new_responses_mask_item)
 
                 tgt_responses.append(responses[i:i + 1, :start])
-                # print(f' new responses: {new_responses[-1].shape}')
-                # print(f' new tgt responses: {tgt_responses[-1].shape}')
 
                 new_prompts_ids.append(prompts_ids[i:i+1,...])
                 new_position_ids.append(position_ids[i:i+1,...])
@@ -366,13 +463,12 @@ class RayMixedTrainer(RayPPOTrainer):
                 raw_target_prompts_selected.append(raw_target_prompts[i])
                 assert answers_prefix[-1].strip() != "", \
                     f"Answer prefix should not be empty {start}, {self.tokenizer.decode(responses[i])}"
-                # print(f' answers prefix: {answers_prefix[-1]}')
         explain_prompts = []
         for i in range(len(questions)):
-            explain_prompts.append(self.construct_explain_prompt(questions[i], raw_target_prompts_selected[i],
-                                                                 answers_prefix[i]))
-        print(f' explain texts length: {len(explain_prompts)}')
-        print(f' sampled explain prompts: {explain_prompts[0]}')
+            explain_prompts.append(construct_explain_prompt(questions[i], raw_target_prompts_selected[i],
+                                                            answers_prefix[i]))
+        # print(f' explain texts length: {len(explain_prompts)}')
+        # print(f' sampled explain prompts: {explain_prompts[0]}')
         # print(f' sampled explain prompts: {explain_prompts[1]}')
         explain_prompts_input_ids = \
             [self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")['input_ids'] for prompt in
@@ -381,7 +477,7 @@ class RayMixedTrainer(RayPPOTrainer):
             [self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")['attention_mask'] for prompt in
              explain_prompts]
         max_input_ids_length = max([input_ids.shape[1] for input_ids in explain_prompts_input_ids])
-        print(f'max input ids length: {max_input_ids_length}')
+        # print(f'max input ids length: {max_input_ids_length}')
         explain_prompts_input_ids = [
             pad_sequence_to_length(prompt, max_input_ids_length, self.tokenizer.pad_token_id, left_pad=True)
             for prompt in explain_prompts_input_ids]
@@ -543,6 +639,7 @@ class RayMixedTrainer(RayPPOTrainer):
                         # attention_mask: Tensor(shape=torch.Size([24, 22528]),),
                         # position_ids: Tensor(shape=torch.Size([24, 22528]),),
                         n_off_policy = self.config.actor_rollout_ref.rollout.n_off_policy
+                        # print(f'gen batch: {gen_batch_output.batch}')
                         if n_off_policy > 0:
                             required_keys = ["prompts", "responses", "input_ids", "attention_mask", "position_ids"]
                             assert all(key in gen_batch_output.batch for key in required_keys), "生成的序列数据缺少必要键"
@@ -567,7 +664,7 @@ class RayMixedTrainer(RayPPOTrainer):
                                     "attention_mask": off_attention_mask,
                                     "position_ids": off_position_ids,
                                 }, batch_size=[1])
-                                off_tensor_dict = torch.cat([off_tensor_dict] * n_off_policy, dim=0)
+                                off_tensor_dict: TensorDict = torch.cat([off_tensor_dict] * n_off_policy, dim=0)
                                 mixed_batch_output_item: TensorDict = torch.cat([gen_batch_output_item, off_tensor_dict], dim=0)
                                 on_policy_mask = torch.ones_like(mixed_batch_output_item['responses'],
                                                                  dtype=torch.int64)
@@ -581,7 +678,8 @@ class RayMixedTrainer(RayPPOTrainer):
                             gen_batch_mixed_output = gen_batch_output
                             on_policy_mask = torch.ones_like(gen_batch_mixed_output.batch['responses'], dtype=torch.int64)
                             gen_batch_mixed_output.batch['on_policy_mask'] = on_policy_mask
-                        
+
+                        # print(f'gen batch: {gen_batch_mixed_output.batch}')
                         timing_raw.update(gen_batch_mixed_output.meta_info["timing"])
                         gen_batch_mixed_output.meta_info.pop("timing", None)
 
@@ -596,7 +694,7 @@ class RayMixedTrainer(RayPPOTrainer):
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
-                        print('use rm: ', self.use_rm)
+                        # print('use rm: ', self.use_rm)
                         if self.use_rm:
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(new_batch)
@@ -604,11 +702,22 @@ class RayMixedTrainer(RayPPOTrainer):
 
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        try:
-                            reward_tensor, reward_extra_infos_dict = self.reward_fn(new_batch)
-                        except Exception as e:
-                            print(f"Error in reward_fn: {e}")
-                            reward_extra_infos_dict = {}
+                        reward_tensor, reward_extra_infos_dict = self.reward_fn(new_batch)
+                        collected_rollouts = []
+                        full_responses_str = reward_extra_infos_dict['response_str']
+                        for index, response_str in enumerate(full_responses_str):
+                            collected_rollouts.append({
+                                "response": response_str,
+                                "score": reward_extra_infos_dict['acc'][index],
+                                "prompt": reward_extra_infos_dict['prompt_str'][index],
+                                "response_valid_length": reward_extra_infos_dict['response_valid_length'][index],
+                                "ground_truth": reward_extra_infos_dict['ground_truth'][index],
+                            })
+                        print(reward_extra_infos_dict['response_valid_length'][0])
+                        with open(f'rollouts/{self.global_steps}.json', 'w') as f:
+                            json.dump(collected_rollouts, f, indent=4)
+                        exit(0)
+                            # print(reward_extra_infos_dict['data_source'])
 
                         new_batch.batch["token_level_scores"] = reward_tensor
 
@@ -723,8 +832,7 @@ class RayMixedTrainer(RayPPOTrainer):
 
                     with marked_timer("adv", timing_raw, "brown"):
                         # compute advantages, executed on the driver process
-                        # TODO: 需要确认这里是否需要std归一化
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+                        norm_adv_by_std_in_grpo = self.config.algorithm["norm_adv_by_std_in_grpo"]
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -737,71 +845,87 @@ class RayMixedTrainer(RayPPOTrainer):
                     # print(f' non tensors batch keys(): {batch.non_tensor_batch.keys()}')
                     # torch.save(batch.batch, os.path.join('entropy_examples', f'{self.global_steps}.pt'))
 
-                    # # TODO：在外部处理语义块分割
-                    # batch = self.get_answers_blocks(batch)
-                    # # print(f'batch with parsed blocks: {batch}')
-                    #
+                    # TODO：在外部处理语义块分割
+                    batch = self.get_answers_blocks(batch)
+
+                    filtered_blocks = generate_answers_mask(batch.non_tensor_batch["queries"].tolist(),
+                                          batch.non_tensor_batch["blocks_length"].tolist(),
+                                          batch.non_tensor_batch["parsed_blocks"].tolist(),
+                                          batch.non_tensor_batch["raw_tgt_prompts"].tolist())
                     # batch = self.answers_checker_wg.generate_answers_mask(batch)
-                    # print(f'type of batch: {type(batch)}, type of item in batch: {type(batch[0])}')
-                    # # print(f' batch: {batch.batch}')
-                    #
-                    # sft_blocks_inputs, incomplete_responses, pad_times, tgt_incomplete_responses = \
-                    #                 self.gather_sft_blocks_input(batch)
-                    # print(
-                    #     f'input: {self.tokenizer.decode(sft_blocks_inputs.batch["input_ids"][0], skip_special_tokens=True)}')
-                    # sft_inputs_batch = sft_blocks_inputs.pop(
-                    #     batch_keys=["input_ids", "attention_mask"]
-                    # )
-                    # # print(f' sft blocks input: {sft_blocks_inputs}')
-                    # sft_blocks_result = self.actor_rollout_wg.generate_sft_blocks(sft_inputs_batch)
-                    # print(f'complete responses: {self.tokenizer.decode(sft_blocks_result.batch["responses"][0], skip_special_tokens=True)}')
-                    # # print(f'sft_blocks_result: {sft_blocks_result}')
-                    # pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
-                    # prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
-                    #
-                    # # 用于强化学习的input_ids、attention_mask
-                    # sft_blocks_inputs.batch['responses'] = torch.cat(
-                    #     [pad_sequence_to_length(response, pad_length, self.tokenizer.pad_token_id, left_pad=False)
-                    #      for response in incomplete_responses], dim=0
-                    # )
-                    # sft_blocks_inputs.batch['input_ids'] = torch.cat(
-                    #     [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['responses']], dim=1
-                    # )
-                    # sft_blocks_inputs.batch['attention_mask'] = torch.cat(
-                    #     [sft_blocks_inputs.batch['tgt_attention_mask'], sft_blocks_inputs.batch['response_mask']],
-                    #     dim=-1
-                    # )
-                    #
-                    # sft_blocks_inputs.batch['tgt_responses'] = torch.cat(
-                    #     [pad_sequence_to_length(
-                    #         torch.cat([response, sft_blocks_result.batch['responses'][idx:idx+1,...]], dim=-1),
-                    #         pad_length, self.tokenizer.pad_token_id, left_pad=False)
-                    #      for idx, response in enumerate(tgt_incomplete_responses)], dim=0
-                    # )
-                    # sft_blocks_inputs.batch['tgt_input_ids'] = torch.cat(
-                    #     [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['tgt_responses']], dim=1
-                    # )
-                    # pad_tgt_attention_mask = torch.zeros_like(sft_blocks_inputs.batch['response_mask'])
-                    # for idx, response in enumerate(tgt_incomplete_responses):
-                    #     response_length = response.shape[-1]
-                    #     start = prompt_length+response_length
-                    #     end = start+sft_blocks_result.batch['responses'].shape[1]
-                    #     pad_tgt_attention_mask[idx:idx+1, start:end] = 1
-                    # sft_blocks_inputs.batch['tgt_attention_mask'] = torch.cat(
-                    #     [sft_blocks_inputs.batch['tgt_attention_mask'], pad_tgt_attention_mask], dim=-1
-                    # )
-                    # # for idx in range(sft_blocks_inputs.batch['tgt_attention_mask'].shape[0]):
-                    # #     print((sft_blocks_inputs.batch['tgt_input_ids'][idx:idx+1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
-                    # #     print(sft_blocks_inputs.batch['tgt_attention_mask'][idx:idx+1, prompt_length:].sum())
-                    # #     print((sft_blocks_inputs.batch['input_ids'][idx:idx + 1, prompt_length:]!=self.tokenizer.pad_token_id).sum())
-                    # #     print(sft_blocks_inputs.batch['attention_mask'][idx:idx+1, prompt_length:].sum())
-                    # # print(f' sft blocks input: {sft_blocks_inputs}')
-                    #
-                    # with marked_timer("dynamic sft", timing_raw, "red"):
-                    #     sft_blocks_inputs.meta_info = batch.meta_info
-                    #     sft_blocks_inputs.meta_info['calculate_rl_loss'] = True
-                    #     sft_blocks_inputs.meta_info['calculate_sft_loss'] = True
-                    #     sft_output = self.actor_rollout_wg.update_actor(sft_blocks_inputs)
+
+                    sft_blocks_inputs, incomplete_responses, pad_times, tgt_incomplete_responses = \
+                                    self.gather_sft_blocks_input(batch, filtered_blocks)
+                    sft_inputs_batch = sft_blocks_inputs.pop(
+                        batch_keys=["input_ids", "attention_mask"]
+                    )
+                    sft_blocks_result = self.actor_rollout_wg.generate_sft_blocks(sft_inputs_batch)
+
+                    batch_size = sft_inputs_batch.batch['input_ids'].shape[0]
+                    collected = []
+                    for i in range(batch_size):
+                        prefix_answer = self.tokenizer.decode(sft_inputs_batch.batch['input_ids'][i],
+                                                              skip_special_tokens=True)
+                        # print(f'prefix answer: {prefix_answer}')
+                        complete_answer = self.tokenizer.decode(sft_blocks_result.batch['responses'][i],
+                                                                skip_special_tokens=True)
+                        # print(f'complete answer: {complete_answer}')
+                        collected.append({
+                            "prefix_answer": prefix_answer, # 这个是有self explain的提示prompt的
+                            "complete_answer": complete_answer,
+                            "completed_tokens_num": sft_blocks_result.batch['attention_mask'][i].sum().item(),
+                            "answer_before": self.tokenizer.decode(
+                                incomplete_responses[i][0].tolist(), skip_special_tokens=True),
+                            "answer_after": self.tokenizer.decode(
+                                tgt_incomplete_responses[i][0].tolist(), skip_special_tokens=True) + complete_answer
+                        })
+                    with open(f'self_explain_examples/{self.global_steps}.jsonl', 'w', encoding='utf-8') as f:
+                        for line in collected:
+                            f.write(json.dumps(line, ensure_ascii=False) + '\n')
+                    pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
+                    prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
+
+                    # 用于强化学习的input_ids、attention_mask
+                    sft_blocks_inputs.batch['responses'] = torch.cat(
+                        [pad_sequence_to_length(response, pad_length, self.tokenizer.pad_token_id, left_pad=False)
+                         for response in incomplete_responses], dim=0
+                    )
+                    sft_blocks_inputs.batch['input_ids'] = torch.cat(
+                        [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['responses']], dim=1
+                    )
+                    sft_blocks_inputs.batch['attention_mask'] = torch.cat(
+                        [sft_blocks_inputs.batch['tgt_attention_mask'], sft_blocks_inputs.batch['response_mask']],
+                        dim=-1
+                    )
+
+                    sft_blocks_inputs.batch['tgt_responses'] = torch.cat(
+                        [pad_sequence_to_length_with_trunc(
+                            torch.cat([response, sft_blocks_result.batch['responses'][idx:idx+1,...]], dim=-1),
+                            pad_length, self.tokenizer.pad_token_id, left_pad=False)
+                         for idx, response in enumerate(tgt_incomplete_responses)], dim=0
+                    )
+                    sft_blocks_inputs.batch['tgt_input_ids'] = torch.cat(
+                        [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['tgt_responses']], dim=1
+                    )
+                    response_tgt_attention_mask = torch.zeros_like(sft_blocks_inputs.batch['response_mask'])
+                    for idx, response in enumerate(tgt_incomplete_responses):
+                        response_length = response.shape[-1]
+                        start = prompt_length+response_length
+                        end = start+sft_blocks_result.batch['attention_mask'][idx].sum().item()
+                        response_tgt_attention_mask[idx:idx+1, start:end] = 1
+                    sft_blocks_inputs.batch['tgt_attention_mask'] = torch.cat(
+                        [sft_blocks_inputs.batch['tgt_attention_mask'], response_tgt_attention_mask], dim=-1
+                    )
+
+                    # for idx in range(sft_blocks_inputs.batch['tgt_attention_mask'].shape[0]):
+                    #     print('tgt attention mask: ', sft_blocks_inputs.batch['tgt_attention_mask'][idx:idx+1, prompt_length:].sum())
+                    #     print('rl attention mask: ', sft_blocks_inputs.batch['attention_mask'][idx:idx+1, prompt_length:].sum())
+
+                    with marked_timer("dynamic sft", timing_raw, "red"):
+                        sft_blocks_inputs.meta_info = batch.meta_info
+                        sft_blocks_inputs.meta_info['calculate_rl_loss'] = True
+                        sft_blocks_inputs.meta_info['calculate_sft_loss'] = True
+                        sft_output = self.actor_rollout_wg.update_actor(sft_blocks_inputs)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -818,8 +942,8 @@ class RayMixedTrainer(RayPPOTrainer):
                                     batch.meta_info['need_analyze_off_grads'] = True
                             if self.config.actor_rollout_ref.rollout.n_off_policy > 0:
                                 batch.meta_info['contain_off_policy'] = True
-                            batch.meta_info['calculate_sft_loss'] = self.config.actor_rollout_ref.actor.calculate_sft_loss
-                            batch.meta_info['calculate_rl_loss'] = self.config.actor_rollout_ref.actor.calculate_rl_loss
+                            batch.meta_info['calculate_sft_loss'] = False
+                            batch.meta_info['calculate_rl_loss'] = True
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

@@ -352,9 +352,8 @@ def build_high_entropy_blocks(
 def build_high_entropy_blocks_tensor(
         tokens: List[List[str]],  # 形状为 [bsz, length] 的字符串列表
         entropies: torch.Tensor,  # 形状为 [bsz, length] 的张量
-        attention_mask: torch.Tensor,  # 形状为 [bsz, length] 的张量，1表示有效，0表示填充
+        attention_mask: torch.Tensor,
         *,
-        # 参数保持不变
         smooth_window: int = 5,
         seed_method: str = "mean_std",
         k_std: float = 1.0,
@@ -396,6 +395,7 @@ def build_high_entropy_blocks_tensor(
         if valid_indices.numel() == 0:
             results.append([])
             continue
+        # print('-----------')
 
         # print(''.join(tokens[i]))
         # print(f' length of tokens: {len(tokens[i])}, length of valid_indices: {valid_indices.numel()}')
@@ -428,6 +428,7 @@ def build_high_entropy_blocks_tensor(
             advantage_of_rollout=advantage_of_rollout,
             verbose=verbose
         )
+        # print('-----------')
 
         # 将块的位置映射回原始序列中的位置
         for block in blocks:
@@ -626,7 +627,7 @@ if __name__ == "__main__":
     H =   [0.2,0.25,0.28,0.35,0.92,0.88,0.8,0.7,0.1,0.22,0.24,0.26,0.3,0.33,0.31,0.29,0.1,0.4,0.42,0.2,0.18]
 
     # 假设没有嵌入函数，就先做块划分
-    blocks = build_high_entropy_blocks(
+    _blocks = build_high_entropy_blocks(
         toks, H,
         smooth_window=3, seed_method="mean_std", k_std=0.8,
         drop_ratio=0.5, max_block_len=16, min_block_len=3,

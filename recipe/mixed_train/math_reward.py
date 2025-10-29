@@ -147,12 +147,16 @@ class RuleBasedRewardManager():
             valid_response_ids = response_ids[:valid_response_length]
 
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+            reward_extra_info['prompt_str'].append(prompt_str)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            reward_extra_info['response_str'].append(response_str)
+            reward_extra_info['response_valid_length'].append(valid_response_length.item())
             eos_token = self.tokenizer.eos_token
             if response_str.endswith(eos_token):
                 response_str = response_str[:-len(eos_token)]
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            reward_extra_info['ground_truth'].append(ground_truth)
             data_source = data_item.non_tensor_batch['data_source']
 
             solution_str = ''

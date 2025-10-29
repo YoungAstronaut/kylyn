@@ -2,9 +2,10 @@ import types
 
 from tensordict import TensorDict
 
+from recipe.mixed_train.extended_rollout_worker import ExtendedRolloutWorker
 from verl import DataProto
 from verl.utils import omega_conf_to_dataclass
-from verl.utils.profiler.performance import reduce_timing, GPUMemoryLogger
+from verl.utils.profiler.performance import reduce_timing, GPUMemoryLogger, topk_reduce_ratio_min_max
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.config import RolloutConfig, HFModelConfig
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
@@ -15,7 +16,7 @@ import numpy as np
 
 from omegaconf import OmegaConf, open_dict
 
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.base.decorator import Dispatch, register, make_nd_compute_dataproto_dispatch_fn
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.device import (
     get_device_name, get_device_id, get_torch_device,
@@ -36,113 +37,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
-
-@GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
-@torch.no_grad()
-def generate_sft_blocks(self, prompts: DataProto, **kwargs) -> DataProto:
-    """Generate sequences for a batch of prompts.
-
-    Args:
-        batch (DataProto): Input batch.
-
-    Returns:
-        DataProto: Output batch.
-        - prompts: [bsz, prompt_length], prompt token ids from dataset.
-        - responses: [bsz, response_length], output token ids include response tokens
-          from LLM generation and observation tokens from tool_calls.
-        - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
-        - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
-          and response tokens.
-        - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
-        - position_ids: [bsz, prompt_length + response_length], incremental position ids.
-
-        For multi-turn conversations:
-        responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
-        response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
-    """
-    idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-    # left-padded attention_mask
-    attention_mask = prompts.batch["attention_mask"]
-
-    # used to construct attention_mask
-    eos_token_id = prompts.meta_info["eos_token_id"]
-
-    batch_size = idx.size(0)
-
-    non_tensor_batch = prompts.non_tensor_batch
-    if "raw_prompt_ids" not in non_tensor_batch:
-        non_tensor_batch["raw_prompt_ids"] = np.array(
-            [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
-        )
-
-    if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-        raise RuntimeError("vllm sharding manager is not work properly.")
-
-    vllm_inputs = [
-        {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
-    ]
-
-    # ensure the type of `prompt_token_ids` passed to vllm is list[int]
-    # https://github.com/volcengine/verl/pull/772
-    for input_data in vllm_inputs:
-        if isinstance(input_data["prompt_token_ids"], np.ndarray):
-            input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
-        elif not isinstance(input_data["prompt_token_ids"], list):
-            raise TypeError(
-                f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
-            )
-
-    max_tokens = prompts.meta_info.get("max_tokens", -1)
-    if max_tokens > 0:
-        kwargs = {"max_tokens": max_tokens}
-
-    # users can customize different sampling_params at different run
-    with self.update_sampling_params(**kwargs):
-        outputs = self.inference_engine.generate(
-            prompts=vllm_inputs,  # because we have already convert it to prompt token id
-            sampling_params=self.sampling_params,
-            use_tqdm=False,
-        )
-
-        # TODO(sgm): disable logprob when recompute_log_prob is enable
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
-        response = []
-        rollout_log_probs = []
-        for output in outputs:
-            for sample_id in range(len(output.outputs)):
-                response_ids = output.outputs[sample_id].token_ids
-                response.append(response_ids)
-        # print(f' response: {response}')
-
-        response = pad_2d_list_to_length(response, self.pad_token_id, max_length=max_tokens).to(
-            idx.device
-        )
-        # print(f' response {response}, shape: {response.shape}')
-
-
-    # TODO(sgm): fix position_ids on right_pad
-    # prompt: left pad + response: right pad
-    # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-    # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-    response_attention_mask = get_response_mask(
-        response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
-    )
-
-    # all the tp ranks should contain the same data here. data in all ranks are valid
-    batch = TensorDict(
-        {
-            "responses": response,
-            "response_attention_mask": response_attention_mask,
-        },
-        batch_size=batch_size,
-    )
-    if self.config.calculate_log_probs:
-        # we will recompute old log prob with actor
-        batch["rollout_log_probs"] = rollout_log_probs
-
-    return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-
 
 class MixedTrainActorRefWorker(ActorRolloutRefWorker):
 
@@ -173,8 +67,7 @@ class MixedTrainActorRefWorker(ActorRolloutRefWorker):
 
         # build rollout worker inside hybrid engine
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
-        rollout_worker = RolloutWorker(config=rollout_config, model_config=model_config)
-        rollout_worker.generate_sft_blocks = types.MethodType(generate_sft_blocks, rollout_worker)
+        rollout_worker = ExtendedRolloutWorker(config=rollout_config, model_config=model_config)
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
 
         if rollout_name == "vllm":
@@ -315,41 +208,37 @@ class MixedTrainActorRefWorker(ActorRolloutRefWorker):
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    @DistProfiler.annotate(color="red", role="generate_sft_block")
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sft_blocks(self, prompts: DataProto):
         # Support all hardwares
         prompts = prompts.to(get_device_id())
 
         assert self._is_rollout
 
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-            "max_tokens": self.config.rollout.self_explain.max_tokens,
-        }
-        prompts.meta_info.update(meta_info)
         timing_generate = {}
-
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
-            vllm_inputs = self.rollout_sharding_manager.preprocess_data(prompts)
             with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sft_blocks(vllm_inputs)
+                output = self.rollout.generate_sft_blocks(prompts=prompts)
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
-
-            output = self.rollout_sharding_manager.postprocess_data(output)
 
         timing_generate.update(self.rollout_sharding_manager.timing)
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
+        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+            timing_generate["generate_sequences"]
+        )
         timing_generate = reduce_timing(timing_generate)
+        timing_generate.update(
+            {
+                "generation_timing/max": timing_generate_max,
+                "generation_timing/min": timing_generate_min,
+                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+            }
+        )
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")
 

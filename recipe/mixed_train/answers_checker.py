@@ -123,7 +123,6 @@ class AnswersChecker(Worker, DistProfilerExtension):
         # self.inference_engine.wake_up()
 
         queries = data.non_tensor_batch["queries"].tolist()
-        # print(f'type of queries: {type(queries)}')
 
         blocks_length = data.non_tensor_batch["blocks_length"].tolist()
         blocks_sum = sum(blocks_length)
@@ -136,6 +135,7 @@ class AnswersChecker(Worker, DistProfilerExtension):
             queries_all += item
         # print(f' queries all: {queries_all}')
         complete_answers = data.non_tensor_batch["raw_tgt_prompts"].tolist()
+        print(f'complete answers: {complete_answers}')
         input_texts = queries_all + complete_answers
         # print(f"input queries length: {len(input_texts)}")
         outputs = self.inference_engine.embed(input_texts, use_tqdm=False)
@@ -146,8 +146,8 @@ class AnswersChecker(Worker, DistProfilerExtension):
         filtered_blocks = []
         # print(f'blocks length: {blocks_length}, blocks sum: {blocks_sum}')
         embeddings_splits = embeddings[:blocks_sum].split(blocks_length, dim=0)
-        input_texts = np.array(queries_all)
-        input_texts_splits = np_split_by_sizes(input_texts, blocks_length)
+        queries_all = np.array(queries_all)
+        input_texts_splits = np_split_by_sizes(queries_all, blocks_length)
         assert len(embeddings_splits) == len(blocks), f'{len(embeddings_splits)} != {len(blocks)}'
         assert len(embeddings_splits) == len(blocks_length), f'{len(embeddings_splits)} != {len(blocks_length)}'
         assert len(input_texts_splits) == len(blocks_length), f'{len(embeddings_splits)} != {len(input_texts_splits)}'
@@ -159,7 +159,8 @@ class AnswersChecker(Worker, DistProfilerExtension):
                 continue
             scores = embeddings_split @ documents[idx:idx+1].T
             # print('shape of scores: ', scores.shape)
-            filtered_scores_index = (scores > self.config.similarity_threshold).nonzero(as_tuple=True)[0].tolist()
+            # filtered_scores_index = (scores > self.config.similarity_threshold).nonzero(as_tuple=True)[0].tolist()
+            filtered_scores_index = (scores > 0).nonzero(as_tuple=True)[0].tolist()
 
             filtered_sum += len(filtered_scores_index)
             # print(f'filtered scores index: {filtered_scores_index}, length: {len(filtered_scores_index)}')
@@ -167,7 +168,7 @@ class AnswersChecker(Worker, DistProfilerExtension):
             for filter_idx in filtered_scores_index:
                 start = blocks[idx][filter_idx].start
                 end = blocks[idx][filter_idx].end
-                print(input_texts_splits[idx][filter_idx], f'score: {scores[filter_idx, 0]:.4f}')
+                print(input_texts_splits[idx][filter_idx].split('Query: ')[-1], f'score: {scores[filter_idx, 0]:.4f}')
                 block_out.append([start, end])
             # print(block_out)
             filtered_blocks.append(block_out)
