@@ -74,7 +74,7 @@ sleep 30
 
 cd /home/jwangxgroup/yuhang/jyh/verl
 bash recipe/mixed_train/run_mixed_train_8b_qwen3_rl_1_sft_0.sh \
-  --devices 0,1,2,3 \
+  --devices 4 \
   --calculate_rl "$CALCULATE_RL" \
   --calculate_sft "$CALCULATE_SFT" \
   --sft_coef "$SFT_COEF"

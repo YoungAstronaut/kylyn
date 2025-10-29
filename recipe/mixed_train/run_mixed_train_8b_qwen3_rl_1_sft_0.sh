@@ -5,8 +5,7 @@
 while [[ $# -gt 0 ]]; do
     case $1 in
         --devices)
-            echo "设备列表: ${2}"
-            devices_num=$(echo "$2" | tr ',' ' ' | wc -w)
+            devices_num="$2"
             echo "设备数量: ${devices_num}"
             shift 2
             ;;
@@ -32,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-calculate_rl_loss=${calculate_rl_loss:-"False"}
+calculate_rl_loss=${calculate_rl_loss:-"True"}
 calculate_sft_loss=${calculate_sft_loss:-"False"}
 sft_coef=${sft_coef:-"0.0"}
 
@@ -56,8 +55,8 @@ output_path=$HOME/jyh/verl/output
 ######
 set -xeuo pipefail
 
-project_name=mixed_train
-experiment_name=pure_rl_Qwen3-8B
+project_name=luffy
+experiment_name=mixed_sft_coef_0.051
 
 
 use_kl_in_reward=False
@@ -78,10 +77,11 @@ loss_agg_mode="token-mean"
 
 enable_filter_groups=False
 filter_groups_metric=acc
-train_prompt_bsz=64  # train_batch_size
+train_prompt_bsz=32  # train_batch_size
 gen_prompt_bsz=128
 n_resp_per_prompt=8
-ppo_mini_bsz=64
+n_off_policy=0
+ppo_mini_bsz=32
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -126,7 +126,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.norm_adv_by_std_in_grpo=False \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
-    actor_rollout_ref.rollout.n_off_policy=0 \
+    actor_rollout_ref.rollout.n_off_policy=${n_off_policy} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
