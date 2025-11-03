@@ -118,7 +118,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
         row_dict = self.dataframe[item]
 
         chat = row_dict.pop(self.prompt_key)
-
+        row_dict['problem'] = chat[-1]['content']
         prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
 
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
