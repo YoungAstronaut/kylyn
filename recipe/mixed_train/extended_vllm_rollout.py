@@ -18,7 +18,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class ExtendedVLLMRollout(vLLMRollout):
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
-    def generate_sft_blocks(self, prompts: DataProto, **kwargs) -> DataProto:
+    def generate_se_blocks(self, prompts: DataProto, **kwargs) -> DataProto:
         idx = prompts.batch["input_ids"]
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -54,7 +54,7 @@ class ExtendedVLLMRollout(vLLMRollout):
         with self.update_sampling_params(**kwargs):
             new_sampling_params = {'n': self.sampling_params.n,
                                    'logprobs': self.sampling_params.logprobs,
-                                   'max_tokens': 128,
+                                   'max_tokens': 200,
                                    'detokenize': False,
                                    'temperature': self.sampling_params.temperature,
                                    'top_p': self.sampling_params.top_p,
@@ -72,7 +72,7 @@ class ExtendedVLLMRollout(vLLMRollout):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=128).to(
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=200).to(
                 idx.device
             )
 
@@ -84,6 +84,8 @@ class ExtendedVLLMRollout(vLLMRollout):
             {
                 "responses": response,
                 "attention_mask": response_attention_mask,
+                "input_ids": idx,
+                "input_attention_mask": attention_mask,
             },
             batch_size=batch_size,
         )

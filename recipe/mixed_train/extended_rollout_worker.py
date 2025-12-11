@@ -101,7 +101,7 @@ class ExtendedRolloutWorker(RolloutWorker):
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="infer"))
-    def generate_sft_blocks(self, prompts: DataProto):
+    def generate_se_blocks(self, prompts: DataProto):
         """Given a batch of prompts, return a batch of responses. Internally, it can use"""
         meta_info = {
             "eos_token_id": self.model_config.generation_config.eos_token_id
@@ -113,5 +113,5 @@ class ExtendedRolloutWorker(RolloutWorker):
         }
         prompts.meta_info.update(meta_info)
 
-        output = self.rollout.generate_sft_blocks(prompts=prompts)
+        output = self.rollout.generate_se_blocks(prompts=prompts)
         return output
