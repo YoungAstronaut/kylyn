@@ -3,7 +3,7 @@ from typing import List, Optional, Dict, Any
 from openai import OpenAI
 
 # MODEL_USED="Kimi-K2-Instruct"
-MODEL_USED="deepseek-r1"
+MODEL_USED="gpt-4o"
 # ------------------ 核心：判定单个候选步骤 ------------------
 def judge_candidate_step_chat(
     problem: str,
@@ -32,7 +32,7 @@ def judge_candidate_step_chat(
         "type": "function",
         "function": {
             "name": "step_verdict",
-            "description": "对候选下一步给出结构化判定结论",
+            "description": "Provide a structured verdict for the candidate next step.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -40,7 +40,14 @@ def judge_candidate_step_chat(
                     "is_correct": {"type": "boolean"},
                     # "error_type": {
                     #     "type": "string",
-                    #     "enum": ["算术/代数错误", "不充分推断", "与前文矛盾", "符号/定义误用", "跳步且关键缺失", "无"]
+                    #     "enum": [
+                    #         "arithmetic/algebraic error",
+                    #         "insufficient inference",
+                    #         "contradiction with previous steps",
+                    #         "misuse of symbols/definitions",
+                    #         "skipped key steps",
+                    #         "none"
+                    #     ]
                     # },
                     "brief_reason": {"type": "string", "maxLength": 100},
                     "minimal_fix": {"type": "string"},
@@ -51,10 +58,18 @@ def judge_candidate_step_chat(
         }
     }]
 
+    # system_msg = (
+    #     "你是一名严格的数学步骤审稿人。仅判断“候选下一步”是否能在逻辑与数学上"
+    #     "由题目与前缀步骤推出；若不成立，指出最小问题与最小修正。"
+    #     "请务必通过调用函数 step_verdict 输出结构化结果，不要长篇推导。"
+    # )
     system_msg = (
-        "你是一名严格的数学步骤审稿人。仅判断“候选下一步”是否能在逻辑与数学上"
-        "由题目与前缀步骤推出；若不成立，指出最小问题与最小修正。"
-        "请务必通过调用函数 step_verdict 输出结构化结果，不要长篇推导。"
+        "You are a strict reviewer of mathematical solution steps. "
+        "Only decide whether the 'candidate next step' can be logically and mathematically "
+        "derived from the problem statement and the preceding steps; if not, point out the "
+        "minimal issue and the minimal correction. "
+        "You must output a structured result by calling the function step_verdict and you "
+        "should not provide long derivations."
     )
 
     prefix_block = "\n".join(f"{i+1}) {s}" for i, s in enumerate(prefix_steps)) or "(空)"
@@ -63,13 +78,16 @@ def judge_candidate_step_chat(
         f"[Problem]\n{problem}\n\n"
         f"[Verified Prefix Steps]\n{prefix_block}\n\n"
         f"[Candidate Step]\n{candidate_step}\n\n"
-        f"[Reference Answer]\n{reference_block}\n\n"
+        # f"[Reference Answer]\n{reference_block}\n\n"
         "[Task]\n"
-        "判断 Candidate Step 是否正确：\n"
-        "- 正确：is_correct=true，error_type=“无”，minimal_fix 为空串或“无需要”。\n"
-        "- 错误：is_correct=false，选择最贴切的 error_type；brief_reason ≤100 字；"
-        "minimal_fix 用一句话给出最小修正。\n"
-        "请通过函数调用 step_verdict 返回结果。"
+        "Determine whether the Candidate Step is correct:\n"
+        "- If correct: is_correct=true, error_type=\"none\", minimal_fix is an empty string "
+        "or \"none needed\".\n"
+        "- If incorrect: is_correct=false, choose the most appropriate error_type; "
+        "if the candidate step is just logical connection words, consider the step correct;"
+        "brief_reason should be at most 100 characters; minimal_fix should provide the "
+        "minimal correction in a single sentence.\n"
+        "Return the result via a call to the function step_verdict."
     )
 
     resp = client.chat.completions.create(
@@ -90,7 +108,10 @@ def judge_candidate_step_chat(
     if tool_calls:
         args_str = tool_calls[0].function.arguments
         try:
-            return json.loads(args_str)
+            result = json.loads(args_str)
+            result['user_msg'] = user_msg
+            print(result)
+            return result
         except json.JSONDecodeError:
             # 极端情况下模型参数带尾随文本，尽量截断到第一个完整对象
             first_brace = args_str.find("{")
@@ -151,9 +172,9 @@ def localize_first_error_chat(
                 try_times += 1
                 print(f"try times: {try_times}")
         if not verdict.get("is_correct", False):
-            return {"k": i, "verdict": verdict}
+            return {"k": i, "verdict": verdict, 'steps': steps}
         prefix.append(step)
 
     # 到这说明每步都判为正确；如果给了标准答案但最终不一致，按需回溯（可自定义）
     return {"k": None, "verdict": {"is_correct": True, "error_type": "无",
-                                   "brief_reason": "未定位到首错", "minimal_fix": "", "confidence": 0.8}}
+                                   "brief_reason": "未定位到首错", "minimal_fix": "", "confidence": 0.8, "steps": steps}}
