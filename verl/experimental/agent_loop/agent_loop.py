@@ -29,14 +29,21 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
+from verl.experimental.agent_loop.utils import resolve_config_path
+from verl.experimental.reward import RewardManagerWorker
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
-from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
-from verl.workers.rollout.async_server import async_server_class
+from verl.utils.rollout_trace import (
+    RolloutTraceConfig,
+    rollout_trace_attr,
+    rollout_trace_op,
+)
+from verl.utils.transferqueue_utils import tqbridge
+from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -87,7 +94,7 @@ class AsyncLLMServerManager:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
-    ) -> list[int]:
+    ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
         Args:
@@ -96,7 +103,7 @@ class AsyncLLMServerManager:
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
 
         Returns:
-            List[int]: List of generated token ids.
+            TokenOutput: token output
         """
         server = self._choose_server(request_id)
         output = await server.generate.remote(
@@ -124,6 +131,8 @@ class AgentLoopOutput(BaseModel):
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    response_logprobs: Optional[list[float]] = None
+    """Log probabilities for the response tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
     reward_score: Optional[float] = None
@@ -132,6 +141,8 @@ class AgentLoopOutput(BaseModel):
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
+    extra_fields: dict[str, Any] = {}
+    """Extra fields for dynamic addition."""
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
@@ -151,8 +162,12 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded response mask."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
+    response_logprobs: Optional[torch.Tensor] = None
+    """Padded log probabilities for the response tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
+    extra_fields: dict[str, Any] = {}
+    """Extra fields for dynamic addition."""
 
 
 # make hydra.utils.instantiate happy
@@ -183,7 +198,7 @@ class AgentLoopBase(ABC):
             tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
             processor (AutoProcessor): Processor for process messages.
         """
-        self.init_class(trainer_config.config, tokenizer, processor, **kwargs)
+        self.init_class(config=trainer_config.config, tokenizer=tokenizer, processor=processor, **kwargs)
         self.config = trainer_config.config
         self.server_manager = server_manager
         self.tokenizer = tokenizer
@@ -237,62 +252,15 @@ def register(agent_name: str):
     return decorator
 
 
-@ray.remote(num_cpus=1)
-class RewardManagerWorker:
-    """Reward manager worker to compute reward score asynchronously to overlap with agent loop."""
-
-    def __init__(self, config: DictConfig, local_path: str) -> None:
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
-        self.reward_manager = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        self.loop = asyncio.get_event_loop()
-
-    async def compute_score(self, output: AgentLoopOutput, kwargs: dict) -> float:
-        """Compute reward score for agent loop output.
-
-        NOTE: Since `reward_manager.__call__` is blocking function, we run it in thread pool to
-        compute multiple samples in parallel.
-
-        Args:
-            output (AgentLoopOutput): Agent loop output.
-            kwargs (dict): Dataset fields from `verl.utils.dataset.RLHFDataset`.
-
-        Returns:
-            float: Reward score.
-        """
-        prompts = torch.tensor(output.prompt_ids, dtype=torch.long).unsqueeze(0)
-        responses = torch.tensor(output.response_ids, dtype=torch.long).unsqueeze(0)
-        attention_mask = torch.ones((1, prompts.shape[1] + responses.shape[1]), dtype=torch.long)
-        batch = TensorDict(
-            {
-                "prompts": prompts,  # [1, prompt_length]
-                "responses": responses,  # [1, response_length]
-                "attention_mask": attention_mask,  # [1, prompt_length + response_length]
-            },
-            batch_size=1,
-        )
-        non_tensor_batch = {
-            **{k: np.array([v]) for k, v in kwargs.items()},
-            "__num_turns__": np.array([output.num_turns]),
-        }
-        data = DataProto(
-            batch=batch,
-            non_tensor_batch=non_tensor_batch,
-        )
-        reward_tensor = await self.loop.run_in_executor(
-            None,
-            self.reward_manager,
-            data,
-        )
-        return reward_tensor.sum(dim=-1).item()
-
-
-@ray.remote
-class AgentLoopWorker:
+class AgentLoopWorkerBase:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle]):
+    def __init__(
+        self,
+        config: DictConfig,
+        server_handles: list[ray.actor.ActorHandle],
+        reward_router_address: str = None,
+    ):
         """Initialize agent loop manager.
 
         Args:
@@ -300,7 +268,12 @@ class AgentLoopWorker:
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
         """
         self.config = config
-        self.server_manager = AsyncLLMServerManager(config, server_handles)
+
+        # for recipe to change
+        if not hasattr(self, "server_manager"):
+            self.server_manager = AsyncLLMServerManager(config, server_handles)
+
+        self.reward_router_address = reward_router_address
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -310,7 +283,8 @@ class AgentLoopWorker:
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
-            agent_loop_configs = OmegaConf.load(agent_loop_config_path)
+            resolved_path = resolve_config_path(agent_loop_config_path)
+            agent_loop_configs = OmegaConf.load(resolved_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
         if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
@@ -323,7 +297,7 @@ class AgentLoopWorker:
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False,
             ),
-        ).remote(self.config, local_path)
+        ).remote(self.config, self.reward_router_address)
 
         trace_config = self.config.actor_rollout_ref.rollout.get("trace", {})
         RolloutTraceConfig.init(
@@ -333,6 +307,7 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
         )
 
+    @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
 
@@ -359,6 +334,7 @@ class AgentLoopWorker:
             temperature=config.temperature,
             top_p=config.top_p,
             repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
         )
 
         # override sampling params for validation
@@ -368,7 +344,8 @@ class AgentLoopWorker:
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
-            batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
+            default_agent_loop = config.agent.default_agent_loop
+            batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
 
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
@@ -418,8 +395,6 @@ class AgentLoopWorker:
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
-            if output.reward_score is None and not self.config.reward_model.enable:
-                output.reward_score = await self.reward_manager_worker.compute_score.remote(output, kwargs)
 
             # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
             # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
@@ -472,6 +447,11 @@ class AgentLoopWorker:
             if response_mask_output["input_ids"].dim() == 1:
                 response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
+            response_logprobs = None
+            if output.response_logprobs is not None:
+                pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
+                response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+
             response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
             attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
             input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -486,7 +466,7 @@ class AgentLoopWorker:
             ):
                 from verl.models.transformers.qwen2_vl import get_rope_index
 
-                images = output.multi_modal_data.get("image", None)
+                images = getattr(output, "multi_modal_data", {}).get("image", None)
                 current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
                 multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
                 multi_modal_inputs.pop("input_ids", None)
@@ -500,7 +480,7 @@ class AgentLoopWorker:
                 video_grid_thw = multi_modal_inputs.get("video_grid_thw")
                 second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
 
-                position_ids = get_rope_index(
+                vision_position_ids = get_rope_index(
                     self.processor,
                     input_ids=input_ids.squeeze(0),
                     image_grid_thw=image_grid_thw,
@@ -508,8 +488,41 @@ class AgentLoopWorker:
                     second_per_grid_ts=second_per_grid_ts,
                     attention_mask=attention_mask.squeeze(0),
                 ).unsqueeze(0)  # (1, 3, seq_len)
+
+                valid_mask = attention_mask[0].bool()
+                text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                text_position_ids = text_position_ids.unsqueeze(0)
+                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
             else:
                 position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+            enable_async_reward = (
+                self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
+            ) or not self.config.reward_model.enable
+            if output.reward_score is None and enable_async_reward:
+                batch = TensorDict(
+                    {
+                        "prompts": prompt_output["input_ids"],  # [1, prompt_length]
+                        "responses": response_output["input_ids"],  # [1, response_length]
+                        "attention_mask": attention_mask,  # [1, prompt_length + response_length]
+                        "input_ids": input_ids,  # [1, prompt_length + response_length]
+                        "position_ids": position_ids,
+                    },
+                    batch_size=1,
+                )
+                non_tensor_batch = {
+                    **{k: np.array([v]) for k, v in kwargs.items()},
+                    "__num_turns__": np.array([output.num_turns]),
+                    "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                }
+
+                data = DataProto(
+                    batch=batch,
+                    non_tensor_batch=non_tensor_batch,
+                )
+                result = await self.reward_manager_worker.compute_score.remote(data)
+                output.reward_score = result["reward_score"]
+                output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
 
             return _InternalAgentLoopOutput(
                 prompt_ids=prompt_output["input_ids"],
@@ -518,11 +531,13 @@ class AgentLoopWorker:
                 position_ids=position_ids,
                 response_mask=response_mask,
                 attention_mask=attention_mask,
+                response_logprobs=response_logprobs,
                 multi_modal_inputs=multi_modal_inputs,
                 multi_modal_data=output.multi_modal_data,
                 reward_score=output.reward_score,
                 num_turns=output.num_turns,
                 metrics=output.metrics,
+                extra_fields=output.extra_fields,
             )
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
@@ -534,6 +549,9 @@ class AgentLoopWorker:
         attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
+        optional_outputs = {}
+        if inputs[0].response_logprobs is not None:
+            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
 
         batch = TensorDict(
             {
@@ -544,6 +562,7 @@ class AgentLoopWorker:
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
                 "position_ids": position_ids,
+                **optional_outputs,
             },
             batch_size=len(inputs),
         )
@@ -560,13 +579,60 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
 
+        # add reward_extra_info to non_tensor_batch
+        reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
+        reward_extra_keys = list(reward_extra_infos[0].keys())
+        for key in reward_extra_keys:
+            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
+        # Collect extra fields from all inputs and convert them to np.ndarray
+        extra_fields = {}
+        all_keys = set(key for input_item in inputs for key in input_item.extra_fields)
+        for key in all_keys:
+            temp_arr = np.empty(len(inputs), dtype=object)
+            temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
+            extra_fields[key] = temp_arr
+
+        non_tensor_batch.update(extra_fields)
+        return DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
+        )
+
+    def create_transferqueue_client(self, controller_infos, storage_infos, role):
+        """Create a client for data system(transfer queue)."""
+        from verl.single_controller.ray.base import get_random_string
+        from verl.utils.transferqueue_utils import create_transferqueue_client
+
+        client_name = get_random_string(length=6)
+        create_transferqueue_client(
+            client_id=f"{role}_worker_{client_name}",
+            controller_infos=controller_infos,
+            storage_infos=storage_infos,
+        )
+
+
+@ray.remote
+class AgentLoopWorker(AgentLoopWorkerBase):
+    """Agent loop worker takes a batch of messages and run each message in an agent loop."""
+
+    def __init__(
+        self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], reward_router_address: str = None
+    ):
+        """Initialize agent loop manager.
+        Args:
+            config (DictConfig): YAML config.
+            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            reward_router_address (str): reward router address.
+        """
+        super().__init__(config, server_handles, reward_router_address)
 
 
 async def get_trajectory_info(step, index, validate):
@@ -594,89 +660,90 @@ async def get_trajectory_info(step, index, validate):
 class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
-    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup):
+    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
         """Initialize agent loop manager.
 
         Args:
             config (DictConfig): trainer config.
-            worker_group (RayWorkerGroup): ActorRolloutRef worker group.
+            worker_group (RayWorkerGroup): ActorRolloutRef worker group for hybrid mode; None for standalone mode.
         """
         self.config = config
         self.worker_group = worker_group
+        self.reward_model_manager = None
+        self.reward_router_address = None
+        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
+            from verl.experimental.reward import RewardModelManager
+
+            self.reward_model_manager = RewardModelManager(config.reward_model, rm_wg)
+            self.reward_router_address = self.reward_model_manager.get_router_address()
+
+        # for recipe to change
+        if not hasattr(self, "rollout_replica_class"):
+            self.rollout_replica_class = get_rollout_replica_class(self.config.actor_rollout_ref.rollout.name)
+        if not hasattr(self, "agent_loop_workers_class"):
+            self.agent_loop_workers_class = AgentLoopWorker
 
         self._initialize_llm_servers()
         self._init_agent_loop_workers()
 
         # Initially we're in sleep mode.
-        self.sleep()
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            self.sleep()
 
     def _initialize_llm_servers(self):
-        self.rollout_tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
-        self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
-
-        workers_info = ray.get(
-            [
-                worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
-                for worker in self.worker_group.workers
-            ]
+        rollout_world_size = (
+            self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+            * self.config.actor_rollout_ref.rollout.data_parallel_size
+            * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
         )
-        assert len(workers_info) == self.worker_group.world_size
+        world_size = (
+            self.worker_group.world_size
+            if self.worker_group
+            else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        )
+        num_replicas = world_size // rollout_world_size
 
-        self.async_llm_servers = [None] * self.rollout_dp_size
-        self.server_addresses = [None] * self.rollout_dp_size
-
-        if self.config.actor_rollout_ref.rollout.agent.custom_async_server:
-            server_class = async_server_class(
-                rollout_backend=self.config.actor_rollout_ref.rollout.name,
-                rollout_backend_module=self.config.actor_rollout_ref.rollout.agent.custom_async_server.path,
-                rollout_backend_class=self.config.actor_rollout_ref.rollout.agent.custom_async_server.name,
+        rollout_config = self.config.actor_rollout_ref.rollout
+        model_config = self.config.actor_rollout_ref.model
+        self.rollout_replicas = [
+            self.rollout_replica_class(
+                replica_rank=replica_rank,
+                config=rollout_config,
+                model_config=model_config,
+                gpus_per_node=self.config.trainer.n_gpus_per_node,
             )
+            for replica_rank in range(num_replicas)
+        ]
+        if self.worker_group:
+            self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
         else:
-            server_class = async_server_class(rollout_backend=self.config.actor_rollout_ref.rollout.name)
+            self._run_all([server.init_standalone() for server in self.rollout_replicas])
+        self.server_handles = [server._server_handle for server in self.rollout_replicas]
+        self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
-        # Start all server instances, restart if address already in use.
-        unready_dp_ranks = set(range(self.rollout_dp_size))
-        while len(unready_dp_ranks) > 0:
-            servers = {
-                rollout_dp_rank: server_class.options(
-                    # make sure AsyncvLLMServer colocates with its corresponding workers
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=workers_info[rollout_dp_rank * self.rollout_tp_size],
-                        soft=False,
-                    ),
-                    name=f"async_llm_server_{rollout_dp_rank}",
-                ).remote(self.config, self.rollout_dp_size, rollout_dp_rank, self.worker_group.name_prefix)
-                for rollout_dp_rank in unready_dp_ranks
-            }
+        print(f"AgentLoopManager: {self.server_addresses}")
 
-            for rollout_dp_rank, server in servers.items():
-                try:
-                    address = ray.get(server.get_server_address.remote())
-                    self.server_addresses[rollout_dp_rank] = address
-                    self.async_llm_servers[rollout_dp_rank] = server
-                    unready_dp_ranks.remove(rollout_dp_rank)
-                except Exception:
-                    ray.kill(server)
-                    print(f"rollout server {rollout_dp_rank} failed, maybe address already in use, restarting...")
-
-        # All server instances are ready, init AsyncLLM engine.
-        ray.get([server.init_engine.remote() for server in self.async_llm_servers])
+        # Update Prometheus configuration with server addresses
+        if rollout_config.prometheus.enable:
+            if rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            update_prometheus_config(rollout_config.prometheus, self.server_addresses)
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
 
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"]["CPU"] > 0]
+        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
             self.agent_loop_workers.append(
-                AgentLoopWorker.options(
+                self.agent_loop_workers_class.options(
                     name=f"agent_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.async_llm_servers)
+                ).remote(self.config, self.server_handles, self.reward_router_address)
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -688,8 +755,12 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
+        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+            self.reward_model_manager.wake_up()
+
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -700,12 +771,14 @@ class AgentLoopManager:
         output = DataProto.concat(outputs)
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
+        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+            self.reward_model_manager.sleep()
 
         # calculate performance metrics
-        metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
+        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
 
-        output.meta_info = {"timing": timing}
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
@@ -731,9 +804,15 @@ class AgentLoopManager:
         return timing
 
     def wake_up(self):
-        """Wake up all rollout server instances."""
-        ray.get([server.wake_up.remote() for server in self.async_llm_servers])
+        """Wake up all rollout replica instances."""
+        self._run_all([replica.wake_up() for replica in self.rollout_replicas])
 
     def sleep(self):
-        """Sleep all rollout server instances."""
-        ray.get([server.sleep.remote() for server in self.async_llm_servers])
+        """Sleep all rollout replica instances."""
+        self._run_all([replica.sleep() for replica in self.rollout_replicas])
+
+    def _run_all(self, tasks: list[asyncio.Task]):
+        async def run_all():
+            await asyncio.gather(*tasks)
+
+        asyncio.run(run_all())

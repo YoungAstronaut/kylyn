@@ -31,7 +31,11 @@ pre-commit install
 # for staged changes
 pre-commit run
 # for all files in the repo
-# pre-commit run --all-files
+pre-commit run --all-files
+# run a specific hook with pre-commit
+# pre-commit run --all-files --show-diff-on-failure --color=always <hood-id>
+pre-commit run --all-files --show-diff-on-failure --color=always ruff
+pre-commit run --all-files --show-diff-on-failure --color=always autogen-trainer-cfg
 ```
 
 ## Testing
@@ -56,6 +60,7 @@ If possible, please add CI test(s) for your new feature:
 pip install -e .[test]
 
 # Install documentation dependencies
+cd docs
 pip install -r requirements-docs.txt
 
 # Generate HTML docs

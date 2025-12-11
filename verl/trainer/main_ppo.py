@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
 import os
@@ -26,6 +26,8 @@ from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.utils import need_critic, need_reference_policy
+from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
 
@@ -41,13 +43,14 @@ def main(config):
 
 
 # Define a function to run the PPO-like training process
-def run_ppo(config) -> None:
+def run_ppo(config, task_runner_class=None) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
 
     Args:
         config: Training configuration object containing all necessary parameters
                 for distributed PPO training including Ray initialization settings,
                 model paths, and training hyperparameters.
+        task_runner_class: For recipe to change TaskRunner.
     """
     # Check if Ray is not initialized
     if not ray.is_initialized():
@@ -58,10 +61,20 @@ def run_ppo(config) -> None:
         default_runtime_env = get_ppo_ray_runtime_env()
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
+
+        if config.transfer_queue.enable:
+            # Add runtime environment variables for transfer queue
+            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
+            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            runtime_env_kwargs["env_vars"] = runtime_env_vars
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+
+    if task_runner_class is None:
+        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -77,9 +90,9 @@ def run_ppo(config) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = TaskRunner.remote()
+        runner = task_runner_class.remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -89,7 +102,6 @@ def run_ppo(config) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
 
@@ -169,6 +181,16 @@ class TaskRunner:
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
+        # TODO Here you can use the new registration method to support dynamic registration of roles
+        if config.reward_model.enable_resource_pool:
+            if config.reward_model.n_gpus_per_node <= 0:
+                raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
+            if config.reward_model.nnodes <= 0:
+                raise ValueError("config.reward_model.nnodes must be greater than 0")
+
+            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
+            resource_pool_spec["reward_pool"] = reward_pool
+
         self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -181,14 +203,26 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         if config.reward_model.enable:
-            if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
+            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+            if use_legacy_worker_impl in ["auto", "enable"]:
+                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+                    from verl.workers.fsdp_workers import RewardModelWorker
+                elif config.reward_model.strategy == "megatron":
+                    from verl.workers.megatron_workers import RewardModelWorker
+                else:
+                    raise NotImplementedError
+            elif use_legacy_worker_impl == "disable":
+                from verl.workers.roles import RewardModelWorker
+
+                print("Using new worker implementation")
             else:
-                raise NotImplementedError
+                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+
             self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            self.mapping[Role.RewardModel] = "global_pool"
+            if config.reward_model.enable_resource_pool:
+                self.mapping[Role.RewardModel] = "reward_pool"
+            else:
+                self.mapping[Role.RewardModel] = "global_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
@@ -219,20 +253,6 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
-
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
@@ -247,6 +267,27 @@ class TaskRunner:
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
+        # validate config
+        validate_config(
+            config=config,
+            use_reference_policy=need_reference_policy(self.role_worker_mapping),
+            use_critic=need_critic(config),
+        )
+
+        # Download the checkpoint from HDFS to the local machine.
+        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+
+        # Instantiate the tokenizer and processor.
+        from verl.utils import hf_processor, hf_tokenizer
+
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # Used for multimodal LLM, could be None
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
@@ -260,8 +301,22 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        train_dataset = create_rl_dataset(
+            config.data.train_files,
+            config.data,
+            tokenizer,
+            processor,
+            is_train=True,
+            max_samples=config.data.get("train_max_samples", -1),
+        )
+        val_dataset = create_rl_dataset(
+            config.data.val_files,
+            config.data,
+            tokenizer,
+            processor,
+            is_train=False,
+            max_samples=config.data.get("val_max_samples", -1),
+        )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -281,11 +336,12 @@ class TaskRunner:
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()
+
         # Start the training process.
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
+def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     """Create a dataset.
 
     Arguments:
@@ -318,7 +374,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
         dataset_cls = DynamicGenDataset
         print("Using DynamicGenDataset for data generation.")
-
     else:
         # Use the default RLHFDataset class if no custom class is specified
         dataset_cls = RLHFDataset
@@ -330,6 +385,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
+        max_samples=max_samples,
     )
 
     return dataset
@@ -368,7 +424,9 @@ def create_rl_sampler(data_config, dataset):
     # If shuffling is enabled in the data configuration, create a random sampler.
     elif data_config.shuffle:
         train_dataloader_generator = torch.Generator()
-        train_dataloader_generator.manual_seed(data_config.get("seed", 1))
+        seed = data_config.get("seed")
+        if seed is not None:
+            train_dataloader_generator.manual_seed(seed)
         sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
     else:
         # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.

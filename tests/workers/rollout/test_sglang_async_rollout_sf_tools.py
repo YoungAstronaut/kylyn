@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# noqa
 import asyncio
+import os
 import time
 from copy import deepcopy
 from functools import wraps
@@ -25,20 +25,19 @@ import ray
 from tensordict import TensorDict
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from transformers import AutoConfig, AutoTokenizer
-from utils_sglang import (
-    get_rollout_config,
-    prepare_inputs,
-)
+from utils_sglang import get_rollout_config, prepare_inputs
 
 from verl.protocol import DataProto
 from verl.tools.sandbox_fusion_tools import TokenBucketWorker
-from verl.tools.schemas import (
-    OpenAIFunctionParametersSchema,
-    OpenAIFunctionPropertySchema,
-    OpenAIFunctionSchema,
-    OpenAIFunctionToolSchema,
-)
-from verl.workers.rollout.schemas import AsyncRolloutRequest, AsyncRolloutRequestStateEnum, Message
+from verl.tools.schemas import (OpenAIFunctionParametersSchema,
+                                OpenAIFunctionPropertySchema,
+                                OpenAIFunctionSchema, OpenAIFunctionToolSchema,
+                                ToolResponse)
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.schemas import (AsyncRolloutRequest,
+                                          AsyncRolloutRequestStateEnum,
+                                          Message)
 from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout
 
 sandbox_url = ""
@@ -147,18 +146,18 @@ def skip_if_valid_sandbox(url):
 
 
 class TestRolloutWithTools:
+    local_model_path = os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B")
+
     @pytest.fixture
     def qwen_tokenizer(self):
-        local_model_path = "Qwen/Qwen2.5-0.5B"
-        tokenizer = AutoTokenizer.from_pretrained(local_model_path, padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(self.local_model_path, padding_side="left")
         tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
 
     # we only need this for tokenizer
     @pytest.fixture
     def qwen_model_config(self):
-        local_model_path = "Qwen/Qwen2.5-0.5B"
-        config = AutoConfig.from_pretrained(local_model_path)
+        config = AutoConfig.from_pretrained(self.local_model_path)
         return config
 
     @pytest.fixture
@@ -170,7 +169,7 @@ class TestRolloutWithTools:
             for turn in expect_turn_array
         ]
         preencode_tool_return_array = [
-            qwen_tokenizer.apply_chat_template([turn], tokenize=False, add_generation_prompt=True)
+            ToolResponse(text=qwen_tokenizer.apply_chat_template([turn], tokenize=False, add_generation_prompt=True))
             for turn in tool_return_array
         ]
         return prompts, preencode_turn_array, preencode_tool_return_array
@@ -226,11 +225,12 @@ class TestRolloutWithTools:
         with patch.object(SGLangRollout, "_init_distributed_env", return_value=None), patch.object(
             SGLangRollout, "_init_inference_engine", return_value=None
         ), patch.object(SGLangRollout, "_init_sampling_params", return_value=None):
+            rollout_config: RolloutConfig = omega_conf_to_dataclass(sandbox_fusion_rollout_config, dataclass_type=RolloutConfig)
+            model_config = HFModelConfig(path=self.local_model_path)
             rollout = SGLangRollout(
-                actor_module="",
-                config=sandbox_fusion_rollout_config,
-                processing_class=qwen_tokenizer,
-                model_hf_config=qwen_model_config,
+                config=rollout_config,
+                model_config=model_config,
+                device_mesh=None,
             )
             # set default sampling_params
             rollout.sampling_params = {
@@ -558,7 +558,8 @@ class TestSingleNodeRateLimiterCase(RayMultiProcessTestCase):
 
     def test_rate_limiter(self):
         ray.init("auto", namespace="test", ignore_reinit_error=True)
-        from verl.tools.sandbox_fusion_tools import PoolMode, init_execution_pool
+        from verl.tools.sandbox_fusion_tools import (PoolMode,
+                                                     init_execution_pool)
 
         # exec_worker = ExecutionWorker.options(max_concurrency=10).remote(enable_global_rate_limit=True, rate_limit=3)
         exec_worker = init_execution_pool(
@@ -590,7 +591,8 @@ class TestSingleNodeRateLimiterCase(RayMultiProcessTestCase):
 
     def test_rotten_execution(self):
         ray.init("auto", namespace="test", ignore_reinit_error=True)
-        from verl.tools.sandbox_fusion_tools import PoolMode, init_execution_pool
+        from verl.tools.sandbox_fusion_tools import (PoolMode,
+                                                     init_execution_pool)
 
         # exec_worker = ExecutionWorker.options(max_concurrency=10).remote(enable_global_rate_limit=True, rate_limit=6)
         exec_worker = init_execution_pool(
@@ -622,7 +624,8 @@ class TestMultiNodeRateLimiterCase(RayMultiProcessTestCase):
 
     def test_rate_limiter(self):
         ray.init("auto", namespace="test", ignore_reinit_error=True)
-        from verl.tools.sandbox_fusion_tools import PoolMode, init_execution_pool
+        from verl.tools.sandbox_fusion_tools import (PoolMode,
+                                                     init_execution_pool)
 
         # exec_worker = ExecutionWorker.options(max_concurrency=10).remote(enable_global_rate_limit=True, rate_limit=6)
         exec_worker = init_execution_pool(

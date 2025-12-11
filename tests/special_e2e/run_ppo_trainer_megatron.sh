@@ -9,7 +9,7 @@ NUM_GPUS=${NUM_GPUS:-8}
 
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
-huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
+#huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 USE_DUMMY_MODEL=${USE_DUMMY_MODEL:-False}
 DUMMY_MODEL_PATH=${DUMMY_MODEL_PATH:-${HOME}/dummy_models/${MODEL_ID}}
@@ -58,7 +58,7 @@ COMMON_VPP=${COMMON_VPP:-2}
 COMMON_CP=${COMMON_CP:-2}
 COMMON_TP=${COMMON_TP:-2}
 COMMON_EP=${COMMON_EP:-1}
-COMMON_ETP=${COMMON_ETP:-null}
+COMMON_ETP=${COMMON_ETP:-1}
 
 TRAIN_TP=${TRAIN_TP:-$COMMON_TP}
 INFER_TP=${INFER_TP:-$COMMON_TP}
@@ -127,16 +127,22 @@ fi
 ENGINE=${ENGINE:-"vllm"}
 
 exp_name="$(basename "${MODEL_ID,,}")-megatron-gsm8k-minimal"
+ROLLOUT_MODE=${ROLLOUT_MODE:-sync}
 
-if [ "$ENGINE" = "vllm" ]; then
-    MODE=${MODE:-"sync"}
-    ROLLOUT_MODE_ARG="actor_rollout_ref.rollout.mode=${MODE}"
-    if [ "$MODE" = "async" ]; then
-        ROLLOUT_MODE_ARG="${ROLLOUT_MODE_ARG} data.return_raw_chat=True"
-    fi
-else
-    ROLLOUT_MODE_ARG=""
+RETURN_RAW_CHAT="False"
+SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-False}
+if [ "$ROLLOUT_MODE" = "async" ]; then
+    RETURN_RAW_CHAT="True"
+    SKIP_TOKENIZER_INIT="True"
 fi
+
+OPTIM_MEMORY_EFFICIENT=${OPTIM_MEMORY_EFFICIENT:-False}
+
+PROFILE_ENABLE=${PROFILE_ENABLE:-False}
+PROFILE_STEPS=${PROFILE_STEPS:-[1]}
+PROFILE_RANKS_ALL=${PROFILE_RANKS_ALL:-True}
+PROFILE_RANKS=${PROFILE_RANKS:-[0,1,2,3]}
+DISCRETE=${DISCRETE:-True}  # or True
 
 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
@@ -146,11 +152,15 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     data.train_batch_size=${train_prompt_bsz} \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
+    data.return_raw_chat=${RETURN_RAW_CHAT} \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=$LR_WARMUP_STEPS \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=$OPTIM_MEMORY_EFFICIENT \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=$OPTIM_MEMORY_EFFICIENT \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=$OPTIM_MEMORY_EFFICIENT \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ} \
@@ -171,10 +181,15 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.checkpoint.save_contents=$CHECKPOINT_CONTENTS \
-    actor_rollout_ref.rollout.name="${ENGINE}" ${ROLLOUT_MODE_ARG}\
+    actor_rollout_ref.actor.profiler.enable=$PROFILE_ENABLE \
+    actor_rollout_ref.actor.profiler.ranks=$PROFILE_RANKS \
+    actor_rollout_ref.actor.profiler.all_ranks=$PROFILE_RANKS_ALL \
+    actor_rollout_ref.rollout.name="${ENGINE}" \
+    actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    actor_rollout_ref.rollout.update_weights_bucket_megabytes=128 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     actor_rollout_ref.ref.megatron.use_mbridge=${USE_MBRIDGE} \
@@ -189,8 +204,10 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.ref.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
     critic.optim.lr=2e-5 \
     critic.optim.lr_warmup_steps=$LR_WARMUP_STEPS \
+    +critic.optim.override_optimizer_config.optimizer_cpu_offload=$OPTIM_MEMORY_EFFICIENT \
+    +critic.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=$OPTIM_MEMORY_EFFICIENT \
+    +critic.optim.override_optimizer_config.use_precision_aware_optimizer=$OPTIM_MEMORY_EFFICIENT \
     critic.model.path="${MODEL_PATH}" \
-    critic.model.enable_gradient_checkpointing=False \
     critic.ppo_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     critic.ppo_max_token_len_per_gpu=${forward_max_token_len_per_gpu} \
     critic.megatron.use_mbridge=${USE_MBRIDGE} \
@@ -206,6 +223,9 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     critic.megatron.use_dist_checkpointing=${USE_DIST_CKPT} \
     critic.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
     critic.checkpoint.save_contents=$CHECKPOINT_CONTENTS \
+    critic.profiler.enable=$PROFILE_ENABLE \
+    critic.profiler.ranks=$PROFILE_RANKS \
+    critic.profiler.all_ranks=$PROFILE_RANKS_ALL \
     reward_model.enable=True \
     reward_model.model.path="${MODEL_PATH}" \
     reward_model.micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
@@ -219,6 +239,9 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     reward_model.megatron.param_offload=${RM_PARAM_OFFLOAD} \
     reward_model.megatron.use_dist_checkpointing=${USE_DIST_CKPT} \
     reward_model.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
+    reward_model.profiler.enable=$PROFILE_ENABLE \
+    reward_model.profiler.ranks=$PROFILE_RANKS \
+    reward_model.profiler.all_ranks=$PROFILE_RANKS_ALL \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_penalty=kl \
     algorithm.kl_ctrl.kl_coef=0.001 \
@@ -233,4 +256,8 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.save_freq="${SAVE_FREQ}" \
     trainer.resume_mode="${RESUME_MODE}" \
     trainer.total_epochs=2 \
-    trainer.total_training_steps="${TOTAL_TRAIN_STEPS}" $@
+    trainer.total_training_steps="${TOTAL_TRAIN_STEPS}" \
+    global_profiler.profile_continuous_steps=True \
+    global_profiler.tool=nsys \
+    global_profiler.steps=$PROFILE_STEPS \
+    global_profiler.global_tool_config.nsys.discrete=$DISCRETE $@

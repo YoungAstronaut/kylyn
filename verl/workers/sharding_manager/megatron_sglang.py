@@ -28,12 +28,14 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl.protocol import DataProto, all_gather_data_proto
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_torch_device, set_expandable_segments
+from verl.utils.import_utils import deprecated
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     offload_megatron_model_to_cpu,
     per_tensor_generator,
 )
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import GPUMemoryLogger, log_gpu_memory_usage, simple_timer
 from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
@@ -54,6 +56,7 @@ Megatron Hybrid Engine:
 """
 
 
+@deprecated()
 class MegatronSGLangShardingManager(BaseShardingManager):
     """A sharding manager for Megatron-style training & inference with SGLang.
 
@@ -163,6 +166,8 @@ class MegatronSGLangShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="MegatronSGLangShardingManager enter", logger=logger)
     async def wake_up(self):
+        aggressive_empty_cache(force_sync=True)
+
         if self.offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
         if self.bridge is not None:
@@ -175,10 +180,13 @@ class MegatronSGLangShardingManager(BaseShardingManager):
                 self.transformer_config,
                 self.layer_name_mapping,
             )
+
+        set_expandable_segments(False)
+
         await self.update_weights(per_tensor_param)
         if self.offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-        get_torch_device().empty_cache()
+        aggressive_empty_cache(force_sync=True)
         # important: need to manually set the random states of each tp to be identical.
         if self.device_mesh is not None:
             self.torch_random_states = get_torch_device().get_rng_state()
@@ -194,7 +202,9 @@ class MegatronSGLangShardingManager(BaseShardingManager):
         for model in self.actor_module:
             model.train()
         # add empty cache after each compute
-        get_torch_device().empty_cache()
+        aggressive_empty_cache(force_sync=True)
+
+        set_expandable_segments(True)
 
         # restore random states
         if self.device_mesh is not None:
