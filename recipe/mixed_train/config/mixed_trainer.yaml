@@ -24,7 +24,7 @@ reward_model:
     penalty_factor: 0.0
     log: False
 
-answers_checker:
+embedding_worker:
   ulysses_sequence_parallel_size: 1
   use_remove_padding: True
   model:
@@ -34,7 +34,7 @@ answers_checker:
       param_offload: False
       reshard_after_forward: True
       fsdp_size: -1
-    forward_prefetch: False
+      forward_prefetch: False
   # 配置vllm的参数
   free_cache_engine: False
   tensor_parallel_size: 2
@@ -43,14 +43,45 @@ answers_checker:
   gpu_memory_utilization: 0.5
   load_format: dummy_dtensor
   disable_log_stats: True
-  max_num_batched_tokens: 8192
-  max_model_len: 8192
   enable_chunked_prefill: False
   embedding_model:
     enable: True
-    path: Qwen3/Qwen3-Embedding-4B
-  similarity_threshold: 0.2
-  max_blocks_num: 10
+    path: Qwen3/Qwen3-Embedding-8B
+
+se_rollout_worker:
+  ulysses_sequence_parallel_size: 1
+  self_explain:
+    max_tokens: 100
+    max_blocks_num: 5
+  chunk_size: 8
+  use_remove_padding: True
+  rollout:
+    _target_: recipe.mixed_train.mixed_train_config.MixedTrainRolloutConfig
+    name: vllm
+    calculate_log_probs: False
+    n_off_policy: 1
+    gpu_memory_utilization: 0.5
+    tensor_model_parallel_size: -1
+    enable_chunked_prefill: False
+    max_num_batched_tokens: 8192
+    temperature: 1.0
+    top_p: 0.95
+    top_k: -1
+    free_cache_engine: True
+    dtype: bfloat16
+    enforce_eager: True
+    load_format: dummy_dtensor
+    disable_log_stats: True
+  model:
+    use_remove_padding: True
+    path: Qwen2.5/Qwen2.5-7B-Instruct
+  fsdp_config:
+    wrap_policy:
+      min_num_params: 0
+    param_offload: False
+    reshard_after_forward: True
+    fsdp_size: -1
+    forward_prefetch: False
 
 algorithm:
   filter_groups:
@@ -96,3 +127,5 @@ trainer:
   need_analyze_sft_grads: False
   need_analyze_off_grads: False
   analyze_gradients_freq: 10
+  llm_error_localization: False
+  max_blocks_num: 8 # 一个控制块的token数量，算法优化的参数

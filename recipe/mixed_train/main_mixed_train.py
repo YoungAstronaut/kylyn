@@ -9,7 +9,8 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from recipe.mixed_train.answers_checker import AnswersChecker
+from recipe.mixed_train.embedding_worker import EmbeddingWorker
+from recipe.mixed_train.se_rollout_worker import SERolloutWorker
 from verl.utils.device import is_cuda_available
 
 from .mixed_ray_trainer import RayMixedTrainer, Role
@@ -96,7 +97,8 @@ class TaskRunner:
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(MixedTrainActorRefWorker),
             Role.Critic: ray.remote(CriticWorker),
-            Role.AnswersChecker: ray.remote(AnswersChecker),
+            Role.EmbeddingWorker: ray.remote(EmbeddingWorker),
+            Role.SEWorker: ray.remote(SERolloutWorker),
         }
 
         global_pool_id = "global_pool"
@@ -106,7 +108,8 @@ class TaskRunner:
         mapping = {
             Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
-            Role.AnswersChecker: global_pool_id,
+            Role.EmbeddingWorker: global_pool_id,
+            Role.SEWorker: global_pool_id,
         }
 
         # we should adopt a multi-source reward function here

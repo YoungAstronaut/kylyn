@@ -78,7 +78,7 @@ loss_agg_mode="token-mean"
 enable_filter_groups=False
 filter_groups_metric=acc
 train_prompt_bsz=32  # train_batch_size
-gen_prompt_bsz=128
+gen_prompt_bsz=8
 n_resp_per_prompt=8
 n_off_policy=0
 ppo_mini_bsz=32
@@ -90,7 +90,8 @@ ppo_mini_bsz=32
 
 # Paths
 model_path=$HOME/jyh/llm_models/Qwen/Qwen2.5-Math-7B-16k-think
-embedding_model_path=$HOME/jyh/llm_models/Qwen/Qwen3-Embedding-4B
+embedding_model_path=$HOME/jyh/llm_models/Qwen/Qwen3-Embedding-8B
+se_rollout_model_path=$HOME/jyh/llm_models/Qwen/Qwen2.5-7B-Instruct
 default_local_dir=${output_path}/${project_name}/${experiment_name}
 log_filename=${log_path}/${project_name}/${experiment_name}.log
 mkdir -p ${log_path}/${project_name}
@@ -177,7 +178,15 @@ python3 -m recipe.mixed_train.main_mixed_train \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
-    answers_checker.embedding_model.path="${embedding_model_path}" \
+    embedding_worker.embedding_model.path="${embedding_model_path}" \
+    se_rollout_worker.model.path="${se_rollout_model_path}" \
+    se_rollout_worker.rollout.gpu_memory_utilization=0.80 \
+    se_rollout_worker.rollout.tensor_model_parallel_size=${tensor_model_parallel_size} \
+    se_rollout_worker.rollout.enable_chunked_prefill=True \
+    se_rollout_worker.rollout.max_num_batched_tokens=16384 \
+    se_rollout_worker.rollout.temperature=${temperature} \
+    se_rollout_worker.rollout.top_p=${top_p} \
+    se_rollout_worker.rollout.top_k="${top_k}" \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
@@ -190,5 +199,6 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.need_analyze_sft_grads=False \
     trainer.need_analyze_off_grads=False \
     trainer.analyze_gradients_freq=30 \
+    trainer.llm_error_localization=False \
     trainer.default_local_dir="${default_local_dir}" \
     trainer.resume_mode=auto 2>&1 | tee ${log_filename}
