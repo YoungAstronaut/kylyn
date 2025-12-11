@@ -1,7 +1,9 @@
 import colorsys
 import re
+from ast import Index
 from bisect import bisect_right
 from dataclasses import dataclass
+from heapq import merge
 from typing import List, Optional, Callable, Dict, Any, Tuple
 import math
 import statistics
@@ -16,14 +18,14 @@ CLS = re.escape(PUNCTS)
 PAT = re.compile(rf'(?:[^{CLS}\r\n]*?(?:[{CLS}]|\r?\n)+[ \t]*)|(?:[^{CLS}\r\n]+$)')
 
 # 匹配三引号围起来的代码块（语言可有可无），非贪婪，跨行
-code_re = re.compile(r'```[\s\S]*?```', re.DOTALL)
+code_re = re.compile(r'```[\s\S]*?```\s*', re.DOTALL)
 
 math_re = re.compile(
     r'(?m)'
-    r'^[ \t]*\$\$[ \t]*\r?\n'  # 开：$$ + 换行（已包含开头换行）
+    r'^[ \t]*\$\$[ \t]*\r?'  # 开：$$ + 换行（已包含开头换行）
     r'[\s\S]*?'  # 公式主体（非贪婪）
-    r'\r?\n[ \t]*\$\$[ \t]*'  # 收：$$ 所在行
-    r'(?:\r?\n|$)'  # 关键：把关闭行后的换行也一并吃掉（若有）
+    r'\r?[ \t]*\$\$[ \t]*'  # 收：$$ 所在行
+    r'(?:\r?\s*|$)'  # 关键：把关闭行后的换行也一并吃掉（若有）
 )
 
 sent_re = re.compile(
@@ -32,23 +34,25 @@ sent_re = re.compile(
     r'(?:'
     r'\.{3,}'  # 英文省略号 ...
     r'|…{1,2}'  # 中文省略号 … 或 ……
-    r'|[。！？!?]'  # 中英 ! ?
+    r'|[。？?]'  # 中英 ! ?
     r'|\.(?!\d)'  # 英文句号：前不是1-3位纯数字，且后不是数字（避开 5. / 3.14）
     r'|(?:\\](?=\s|$))'  # 支持以 \] 结尾（后接空白或行/文末）
     r')'
     r'[”’"\)\]\}»》」』]*'  # 句尾闭合符（可选）
     r'(?:\s*\$+)*'  # 你原先的附加：尾随若干个 $（可选）
     r'(?:\s*\\])*'  # 以及尾随反斜杠（可选）
+    r'\s*'
     r')'
 )
 
 
 def split_with_math(text: str) -> list[str]:
-    math_mark_count = 0
-    splits_by_lines = text.split('\n')
-    for line in splits_by_lines:
-        if line.strip() == '$$':
-            math_mark_count += 1
+    # math_mark_count = 0
+    # splits_by_lines = text.split('\n')
+    # for line in splits_by_lines:
+    #     if line.strip() == '$$':
+    #         math_mark_count += 1
+    math_mark_count = text.count('$$')
     if math_mark_count % 2 == 0 and math_mark_count > 2:
         parts = []
         last = 0
@@ -506,7 +510,6 @@ def build_high_entropy_blocks_tensor(
         tokens: List[List[str]],  # 形状为 [bsz, length] 的字符串列表
         entropies: torch.Tensor,  # 形状为 [bsz, length] 的张量
         attention_mask: torch.Tensor,
-        *,
         smooth_window: int = 5,
         seed_method: str = "mean_std",
         k_std: float = 1.0,
@@ -521,13 +524,15 @@ def build_high_entropy_blocks_tensor(
         include_connective_to_left: bool = True,
         merge_overlap: bool = True,
         join_nearby_gap: int = 2,
+        max_span: int = 200,
         embed_fn: Optional[Callable[[str], List[float]]] = None,
         query_text: Optional[str] = None,
         reference_texts: Optional[List[str]] = None,
         sim_threshold_low: float = 0.35,
         reward_of_rollout: Optional[float] = None,
         advantage_of_rollout: Optional[float] = None,
-        verbose: bool = False  # 添加verbose参数控制输出
+        verbose: bool = False,  # 添加verbose参数控制输出，
+        **kwargs
 ) -> List[List[Block]]:
     """
     批量处理版本的 build_high_entropy_blocks
@@ -554,8 +559,17 @@ def build_high_entropy_blocks_tensor(
 
         # print(''.join(tokens[i]))
         # print(f' length of tokens: {len(tokens[i])}, length of valid_indices: {valid_indices.numel()}')
-        seq_tokens = [tokens[i][j] for j in valid_indices.cpu().numpy()]
-        seq_entropies = entropies[i][valid_indices]
+        # try:
+        seq_tokens = tokens[i]
+        # except IndexError as e:
+        #     print(e)
+        #     print(f'valid_indices: {len(valid_indices)} ', (valid_indices.tolist()))
+        #     print(f'tokens: {len(tokens)} ', tokens[i])
+        #     seq_tokens = [responses[i][j] for j in valid_indices.cpu().numpy()]
+        #     seq_tokens = [tokenizer.decode(token, skip_special_tokens=True) for token in seq_tokens]
+        #     print(seq_tokens)
+        #     exit(1)
+        seq_entropies = entropies[i][:len(seq_tokens)]
         assert len(seq_tokens) == seq_entropies.size(0), "tokens 和 entropies 形状应该一致"
 
         # 调用原始函数（需要稍作修改以支持张量）
@@ -582,7 +596,9 @@ def build_high_entropy_blocks_tensor(
             reward_of_rollout=reward_of_rollout,
             advantage_of_rollout=advantage_of_rollout,
             verbose=verbose,
-            block_split_mode="step_block"
+            block_split_mode="step_block",
+            max_span=max_span,
+            eos_probs=kwargs["eos_probs"][i][valid_indices]
         )
         # print('-----------')
 
@@ -597,7 +613,7 @@ def build_high_entropy_blocks_tensor(
     return results
 
 def locate_substrings(pieces: List[str], queries: List[str], first_only: bool = False
-                     ) -> List[tuple[str, List[Tuple[int, int]]]]:
+                     ) -> List[tuple[str, Tuple[int, int]]]:
     """
     对于每个查询子串，返回它在数组 pieces 中的起止索引区间（0-based，闭区间）。
     若一个子串出现多次，默认返回所有出现的 (start_idx, end_idx)；设置 first_only=True 仅返回第一次。
@@ -607,21 +623,30 @@ def locate_substrings(pieces: List[str], queries: List[str], first_only: bool = 
     """
     # 1) 预处理：拼接总串 + 前缀和（字符 -> 数组索引 的映射辅助）
     big = "".join(pieces)
-    prefix = [0]  # prefix[i] = 前 i 个 pieces 的总长度；长度为 len(pieces)+1
+
+    locations = []
+    cur_len = 0
     for s in pieces:
-        prefix.append(prefix[-1] + len(s))
+        locations.append((cur_len, cur_len + len(s) - 1))
+        cur_len += len(s)
+    print(locations)
 
     def charpos_to_piece_idx(pos: int) -> int:
         # 给定 big 中的字符位置 pos，找到其所在的 piece 索引
         # 等价于找到最大的 i 使得 prefix[i] <= pos
-        return bisect_right(prefix, pos) - 1
+        loc = -1
+        for i in range(len(locations)):
+            if locations[i][1] >= pos >= locations[i][0]:
+                loc = i
+                break
+        return loc
 
     # 2) 针对每个查询子串寻找所有出现位置，并映射到 (start_piece_idx, end_piece_idx)
-    ans: List[tuple[str, List[Tuple[int, int]]]] = []
+    ans: List[tuple[str, Tuple[int, int]]] = []
+    last_seq_end = 0
     for q in queries:
         if not q:  # 空串的处理：这里选择返回空（也可以按需定义为所有位置都命中）
-            ans[q] = []
-            continue
+            raise TypeError("the query string is empty")
 
         res: List[Tuple[int, int]] = []
         start = 0
@@ -631,7 +656,9 @@ def locate_substrings(pieces: List[str], queries: List[str], first_only: bool = 
                 break
             end_char_pos = pos + len(q) - 1
             start_piece_idx = charpos_to_piece_idx(pos)
+            # print('start: ', start_piece_idx, ' ', [pieces[start_piece_idx]])
             end_piece_idx = charpos_to_piece_idx(end_char_pos)
+            # print('end: ', end_piece_idx, ' ', [pieces[end_piece_idx]])
             res.append((start_piece_idx, end_piece_idx))
 
             if first_only:
@@ -639,12 +666,23 @@ def locate_substrings(pieces: List[str], queries: List[str], first_only: bool = 
             # 允许重叠匹配：从下一个字符继续找
             start = pos + 1
 
-        ans.append((q,res))
+        for item in res:
+            if item[0] >= last_seq_end:
+                last_seq_end = item[1]
+                ans.append((q,item))
+                break
 
-    return ans
+    final_ans: list[tuple[str, Tuple[int, int]]] = []
+    for i in range(len(ans)):
+        if i != len(ans) - 1:
+            final_ans.append((ans[i][0], (ans[i][1][0], ans[i + 1][1][0])))
+        else:
+            final_ans.append(ans[i])
+
+    return final_ans
 
 def merge_short_segments(
-    step_blocks: List[tuple[str, List[Tuple[int, int]]]],
+    step_blocks: List[tuple[str, Tuple[int, int]]],
     max_span: int  # 过短阈值：当 (end - start + 1) <= max_span 视为“短”
 ) -> tuple[List[Tuple[int, int]], List[str]]:
     """
@@ -664,7 +702,7 @@ def merge_short_segments(
     run_str = ""
 
     for text, seg in step_blocks:
-        s, e = seg[0]
+        s, e = seg
         is_short = (e - s + 1) <= max_span
 
         if is_short:
@@ -709,6 +747,187 @@ def merge_short_segments(
 
     return out, out_texts
 
+def merge_short_texts(
+    step_blocks: List[tuple[str, int]],
+    max_span: int  # 过短阈值：当 (end - start + 1) <= max_span 视为“短”
+) -> tuple[List[int], List[str]]:
+    """
+    输入:
+      segments: [(start, end), ...] 0-based、闭区间，允许无序或重叠。
+    行为:
+      - 把“相邻或重叠（下一段的 start <= 当前连续段的 end + 1）且每段都短”的一串片段合并为一个大区间。
+      - 非短片段原样输出，并作为分隔符把短片段连续段切开。
+    返回:
+      合并后的区间，按 (start, end) 排序。
+    """
+
+    # segs = sorted(segments, key=lambda x: (x[0], x[1]))
+    out: List[int] = []
+    out_texts: list[str] = []
+    run = None  # 当前“短片段连续段” [start, end]
+    run_str = ""
+
+    for text, text_len in step_blocks:
+        is_short = (text_len + 1) <= max_span
+
+        if is_short:
+            if run is None:
+                # print(f'is short: {e - s + 1} run is None')
+                run = text_len
+                run_str += text
+            else:
+                # 相邻或重叠：扩展连续段
+                # print(f'is short: {e - s + 1} run is not None')
+                if text_len + run >= max_span:
+                    out.append((run[0], run[1]))
+                    out_texts.append(run_str)
+                    run = text_len
+                    run_str = text
+                else:
+                    run += text_len
+                    run_str += text
+        else:
+            # 短段连续段若有，先输出
+            if run is not None:
+                out.append(run)
+                out_texts.append(run_str)
+                run = None
+                run_str = ""
+            # 非短片段原样输出
+            out.append(text_len)
+            out_texts.append(text)
+
+    if run is not None:
+        out.append(run)
+        out_texts.append(run_str)
+
+    return out, out_texts
+
+def convert_ids_to_text_splits(ids: torch.Tensor | list[int], tokenizer) -> List[str]:
+    tokens = tokenizer.convert_ids_to_tokens(ids)
+    tokens = [tokenizer.convert_tokens_to_string([token]) if token is not None else "" for token in tokens]
+    return tokens
+
+def text_to_pieces(complete_sentence: str, tokenizer) -> list[str]:
+    enc = tokenizer(
+        complete_sentence,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+    )
+    offsets = enc["offset_mapping"]  # List[(start, end)]
+    pieces: list[str] = []
+
+    cursor = 0  # 当前已经覆盖到的最大字符下标
+    for (s, e) in offsets:
+        # 某些 tokenizer 可能给 (0,0) 或 None
+        if s is None or e is None:
+            pieces.append("")
+            continue
+
+        # 若这个 token 完全落在已经覆盖过的区域，就不再新增任何字符
+        if e <= cursor:
+            pieces.append("")
+            continue
+
+        # 去掉与之前 token 的重叠部分，只取 [max(s, cursor), e)
+        s_clamped = max(s, cursor)
+        piece = complete_sentence[s_clamped:e]
+        pieces.append(piece)
+
+        cursor = e
+
+    big = "".join(pieces)
+
+    # 可选的 sanity check：看一下覆盖情况
+    if not complete_sentence.startswith(big):
+        print("WARNING: pieces 拼起来不是 complete_sentence 的前缀，"
+              "说明 tokenizer 的 offset_mapping 很奇怪，需要额外处理。")
+
+    return pieces
+
+
+def split_into_blocks(complete_sentence: str, tokens: list[str], max_span: int):
+    '''
+
+    :param complete_sentence: 完整的句子
+    :param tokens:
+    :param max_span: 在合并短片段时，合并的阈值。可以把这个阈值设为 0或者1，则所有短片段都原样输出。
+    :return:
+    '''
+    sentences_splits = split_sentences(complete_sentence)
+    # for i, split in enumerate(sentences_splits):
+    #     print('--------------')
+    #     print([split[1]])
+    # print(f'length of tokens: {len(tokens)}')
+    text_splits = []
+    for split in sentences_splits:
+        if split[0] == 'text':
+            text_splits.append(split[1])
+    # print('length of all blocks: ', len(sentences_splits))
+    # print('length of text blocks: ', len(text_splits))
+    step_blocks = locate_substrings(tokens, text_splits)
+    # for k, v in step_blocks:
+    #     print('******', v)
+
+    assert len(step_blocks) == len(text_splits), f'step_blocks:\n {step_blocks} \n text_splits:\n {text_splits}\n tokens: \n {tokens}'
+
+    segments, texts_splits = merge_short_segments(step_blocks, max_span)
+    return segments, texts_splits
+
+def merge_segments_by_prob(segments: list[tuple[int, int]], texts_splits: list[str], probs: list[tuple[float, float]], max_span: int=256):
+    assert len(segments) == len(texts_splits), f'segments: {segments} \n texts_splits: {texts_splits}'
+    assert len(segments) == len(probs), f'segments: {segments} \n probs: {probs}'
+    probs.append((0,0))
+    merged_segments = []
+    merged_texts = []
+
+    tmp_seg = None
+    tmp_text = ""
+    for i, (s, e) in enumerate(segments):
+        # print('text split: ', texts_splits[i])
+        # print(probs[i][1], ' ', probs[i+1][0])
+        is_short = (e - s) <= max_span
+        if not is_short:
+            if tmp_seg is not None:
+                merged_segments.append((tmp_seg[0], tmp_seg[1]))
+                merged_texts.append(tmp_text)
+                tmp_seg = None
+                tmp_text = ""
+            merged_segments.append((s, e))
+            merged_texts.append(texts_splits[i])
+        elif probs[i][1] > 8 * probs[i+1][0]: # TODO: 这个阈值参数可调
+            if tmp_seg is None:
+                merged_segments.append((s, e))
+                merged_texts.append(texts_splits[i])
+            else:
+                if e - s + tmp_seg[1] - tmp_seg[0] >= max_span:
+                    merged_segments.append((tmp_seg[0], tmp_seg[1]))
+                    merged_texts.append(tmp_text)
+                    merged_segments.append((s, e))
+                    merged_texts.append(texts_splits[i])
+                else:
+                    tmp_seg[1] = e
+                    tmp_text += texts_splits[i]
+                    merged_segments.append((tmp_seg[0], tmp_seg[1]))
+                    merged_texts.append(tmp_text)
+                tmp_seg = None
+                tmp_text = ""
+        else:
+            if tmp_seg is None:
+                tmp_seg = [s, e]
+                tmp_text += texts_splits[i]
+            else:
+                if e - s + tmp_seg[1] - tmp_seg[0] >= max_span:
+                    merged_segments.append((tmp_seg[0], tmp_seg[1]))
+                    merged_texts.append(tmp_text)
+                    tmp_seg = [s, e]
+                    tmp_text = texts_splits[i]
+                else:
+                    tmp_seg[1] = e
+                    tmp_text += texts_splits[i]
+    for i in range(len(merged_segments)):
+        print(merged_segments[i], [merged_texts[i]])
+    return merged_segments, merged_texts
 
 def _process_single_sequence(
         tokens: List[str],
@@ -893,34 +1112,35 @@ def _process_single_sequence(
 
     elif block_split_mode == 'step_block':
         complete_sentence = "".join(tokens)
-        sentences_splits = split_sentences(complete_sentence)
-        # for i, split in enumerate(sentences_splits):
-        #     print('--------------')
-        #     print(f'{split[1]}')
-        text_splits = []
-        for split in sentences_splits:
-            if split[0] == 'text':
-                text_splits.append(split[1])
-        print('length of all blocks: ', len(sentences_splits))
-        print('length of text blocks: ', len(text_splits))
-        step_blocks = locate_substrings(tokens, text_splits)
-        # for k, v in step_blocks:
-        #     print(v[0])
-        assert len(step_blocks) == len(text_splits)
+        max_span = kwargs.get('max_span', 200)
+        # segments, texts_splits = split_into_blocks(complete_sentence, tokens, max_span)
+        segments, texts_splits = split_into_blocks(complete_sentence, tokens, 1)
+        # print('merged segments:')
+        # for seg in segments:
+            # print(seg)
+        eos_prob_list = kwargs["eos_probs"].tolist()
 
-        segments, texts_splits = merge_short_segments(step_blocks, 200)
-        print('merged segments:')
-        for seg in segments:
-            print(seg)
+        probs = []
+        for i in range(len(segments)):
+            start, end = segments[i] # start, end是左闭右开区间
+            if i == 0:
+                probs.append((0, eos_prob_list[end-1]))
+            elif i == len(segments)-1:
+                probs.append((eos_prob_list[start], 0))
+            else:
+                probs.append((eos_prob_list[start], eos_prob_list[end-1]))
+        segments, texts_splits = merge_segments_by_prob(segments, texts_splits, probs)
 
         for segment, text in zip(segments, texts_splits):
             start = segment[0]
-            end = segment[1]+1
+            end = segment[1]
+            assert end > start, f'{segment} {text}'
             average_entropy = sum(Hs[start:end])/(end-start)
             # print(f'{k} average entropy: {average_entropy}')
             max_entropy = max(Hs[start:end])
-            print('------------')
-            print(text)
+            # print('------------')
+            # print(''.join(tokens[start:end]))
+            # print(f'end prob: {[tokens[end-1]]} {eos_prob_list[end-1]}, next eos prob: {[tokens[end]]} {eos_prob_list[end]}')
             blocks.append(
                 Block(start=start, end=end, peak_idx=-1, mean_entropy=average_entropy, max_entropy=max_entropy,
                       text=text, meta={})
@@ -932,15 +1152,9 @@ def _process_single_sequence(
 
 # ------- 小示例 -------
 if __name__ == "__main__":
-    toks = ["王","熙","凤","逼","死","尤","二","姐","，","可","见","她","手","段","残","酷","。","然","而","在","…"]
-    H =   [0.2,0.25,0.28,0.35,0.92,0.88,0.8,0.7,0.1,0.22,0.24,0.26,0.3,0.33,0.31,0.29,0.1,0.4,0.42,0.2,0.18]
+    sent = '''
+To solve the indefinite integral \(\int \frac{x}{\sqrt{x^4 - x^2 - 1}} \, dx\), we will follow these steps:
 
-    # 假设没有嵌入函数，就先做块划分
-    _blocks = build_high_entropy_blocks(
-        toks, H,
-        smooth_window=3, seed_method="mean_std", k_std=0.8,
-        drop_ratio=0.5, max_block_len=16, min_block_len=3,
-        stop_on_sentence_boundary=True
-    )
-    # for b in blocks:
-        # print(b.start, b.end, "".join(toks[b.start:b.end]), b.mean_entropy, b.trigger_sft, b.reason)
+1. **Substitution**: First, we can make a substitution to simplify the integral.'''
+    result = sent_tokenize(sent)
+    print(result)
