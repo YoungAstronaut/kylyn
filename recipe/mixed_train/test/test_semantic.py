@@ -1,25 +1,33 @@
 import json
-from typing import List, Tuple
+import os
 
 import torch
-from sympy import false
+from sympy import false  # 注意：这里可能应该是 Python 内置的 False
 from vllm import LLM
 
-from recipe.dapo.embed_utils import TASK_PREFIX, get_detailed_instruct, TASK, build_embed_inputs, \
-    find_first_descent_point, argmin, locate_bad_prefixes, locate_bad_prefix_steps
-from recipe.mixed_train.semantic_blocks import split_into_blocks, text_to_pieces
+from recipe.mixed_train.embed_utils import locate_bad_prefixes, locate_bad_prefix_steps, find_first_descent_point, \
+    argmin
+from recipe.mixed_train.semantic_blocks import text_to_pieces
 from verl.utils import hf_tokenizer
 
 model_name: str = "../llm_models/Qwen/Qwen3-Embedding-8B"
 tokenizer_path = "../llm_models/Qwen/Qwen2.5-7B-Instruct"
-model = LLM(model=model_name, task="embed")          # 实际训练循环里可全局复用，不要反复构造
+
 
 # TASK_PREFIX = (
 #     "Given a cumulative reasoning prefix, evaluate whether its semantic similarity "
 #     "to the reference solution drops compared to the previous prefix."
 # )
 
+# 移除顶层的 model 实例化
+print('PYTORCH_CUDA_ALLOC_CONF: ', os.environ.get("PYTORCH_CUDA_ALLOC_CONF", None))
 def main():
+    # 将 model 实例化移到 main 函数内部
+    model = LLM(model=model_name, task="embed", tensor_parallel_size=1)  # 实际训练循环里可全局复用，不要反复构造
+
+    # 注意：这里缺少了一些函数定义（find_first_descent_point, argmin, locate_bad_prefix_steps）
+    # 请确保它们已在别处定义或在此函数内定义
+
     with open('self_explain_examples/test/1.json', 'r') as f:
         data = json.load(f)
 
@@ -47,7 +55,7 @@ def main():
     for example in false_examples:
         print('---------')
         steps = example['steps']
-        incor_step_idx = example['incor_step_idx']-1
+        incor_step_idx = example['incor_step_idx'] - 1
         standard_answer = example['standard_answer']
         regen_step = example['regen_step']
         # is_regen_step_cor = example['is_regen_step_cor']
@@ -67,7 +75,7 @@ def main():
 
         sim_list = []
         for batch_idx in range(cal_times):
-            steps_batch = steps[batch_idx * max_step_per_batch:min(len(steps), (batch_idx+1) * max_step_per_batch)]
+            steps_batch = steps[batch_idx * max_step_per_batch:min(len(steps), (batch_idx + 1) * max_step_per_batch)]
             bad_mask, best_ref_idx, best_sim = locate_bad_prefixes(steps_batch, ref_steps, model)
             best_sim = best_sim.tolist()
             sim_list += best_sim
@@ -100,4 +108,7 @@ def main():
         print(true_indices)
     print(f'{num / len(false_examples): .4f}')
 
-main()
+
+# 在模块入口处添加保护
+if __name__ == '__main__':
+    main()
