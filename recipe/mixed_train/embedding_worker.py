@@ -1,21 +1,26 @@
 import datetime
+import inspect
 import logging
 import os
 
+import ray
 import torch
 import torch.distributed
 
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
+from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils import hf_tokenizer
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_name,
-    get_nccl_backend,
+    get_nccl_backend, get_torch_device,
 )
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
-from verl.utils.profiler import DistProfiler, DistProfilerExtension
+from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.profiler import DistProfiler, DistProfilerExtension, log_gpu_memory_usage
+from verl.utils.ray_utils import get_event_loop
 from verl.workers.fsdp_workers import create_device_mesh
 
 logger = logging.getLogger(__file__)
@@ -32,12 +37,8 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         self.config = config
-
         import torch.distributed
         if not torch.distributed.is_initialized():
-            # torch.distributed.init_process_group(
-            #     backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
-            # )
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             torch.distributed.init_process_group(
@@ -51,8 +52,7 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()
 
-        fsdp_size = self.config.model.fsdp_config.fsdp_size
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.model.fsdp_config.fsdp_size)
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=omega_conf_to_dataclass(config.get("profiler")))
@@ -62,7 +62,16 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
 
         self.max_blocks_num = self.config.model.get("max_blocks_num", 8)
 
+        self.sleep_level = VLLM_SLEEP_LEVEL
+
+        self.gen_random_states = None
+
     def _build_model(self, config):
+        print(f"[Worker PID {os.getpid()}] 进程启动后第一条日志")
+        print(f"[Worker PID {os.getpid()}] PYTORCH_CUDA_ALLOC_CONF: {os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
+        print(f"[Worker PID {os.getpid()}] torch.cuda.is_initialized(): {torch.cuda.is_initialized()}")
+
+
         # the following line is necessary
         use_shm = config.model.get("use_shm", False)
         # download the checkpoint from hdfs
@@ -73,35 +82,65 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
             "tensor parallel size should be less than or equal to the world size"
         )
-        import os
-
-        os.environ["VLLM_USE_V1"] = "0"
 
         from vllm import LLM
+        print(f"[{os.getpid()}] Starting LLM initialization...")
         self.inference_engine = LLM(
             model=local_path,
+            enable_sleep_mode=config.free_cache_engine,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            # enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
-            skip_tokenizer_init=False,
-            # disable_log_stats=config.disable_log_stats,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            # enable_prefix_caching=False,
-            # trust_remote_code=False,
-            seed=config.get("seed", 0),
             task='embed',
         )
-        print("EmbeddingWorker PID", os.getpid(), "VLLM_USE_V1=", os.environ.get("VLLM_USE_V1"))
-        # self.inference_engine.sleep(2)
+        print(f"[{os.getpid()}] LLM initialization completed!")
+
+    async def fall_into_sleep(self):
+        if self.config.free_cache_engine:
+            log_gpu_memory_usage("Before embedding model offload", logger=logger)
+            await self.release()
+            log_gpu_memory_usage("After embedding model offload", logger=logger)
+
+        aggressive_empty_cache(force_sync=True)
+
+    async def wake_up(self):
+        aggressive_empty_cache(force_sync=True)
+        if self.config.free_cache_engine:
+            log_gpu_memory_usage("Before embedding model wake up", logger=logger)
+            await self.resume(tags=["weights", "kv_cache"])
+            log_gpu_memory_usage("After embedding model wake up", logger=logger)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self._build_model(config=self.config)
+        loop = get_event_loop()
+        loop.run_until_complete(self.fall_into_sleep())
+
+    async def resume(self, tags: list[str]):
+        """Resume rollout weights or kv cache in GPU memory.
+
+        Args:
+            tags: weights or kv_cache.
+        """
+        if not self.config.free_cache_engine:
+            return
+
+        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            self.inference_engine.wake_up(tags=tags)
+        else:
+            self.inference_engine.wake_up()
+
+    async def release(self):
+        """Release weights and kv cache in GPU memory."""
+        self.inference_engine.reset_prefix_cache()
+
+        if not self.config.free_cache_engine:
+            return
+
+        self.inference_engine.sleep(level=self.sleep_level)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE)
     @DistProfiler.annotate(color="brown")

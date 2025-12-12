@@ -182,8 +182,6 @@ python3 -m recipe.mixed_train.main_mixed_train \
     se_rollout_worker.model.path="${se_rollout_model_path}" \
     se_rollout_worker.rollout.gpu_memory_utilization=0.80 \
     se_rollout_worker.rollout.tensor_model_parallel_size=${tensor_model_parallel_size} \
-    se_rollout_worker.rollout.enable_chunked_prefill=True \
-    se_rollout_worker.rollout.max_num_batched_tokens=16384 \
     se_rollout_worker.rollout.temperature=${temperature} \
     se_rollout_worker.rollout.top_p=${top_p} \
     se_rollout_worker.rollout.top_k="${top_k}" \

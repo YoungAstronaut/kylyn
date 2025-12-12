@@ -8,7 +8,6 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from enum import Enum
 from pprint import pprint
 from typing import Optional, Any, Tuple
 
@@ -22,7 +21,7 @@ from torch.utils.data import Sampler
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from recipe.dapo.embed_utils import get_detailed_instruct, TASK, balance_embeddings_batch, \
+from recipe.mixed_train.embed_utils import balance_embeddings_batch, \
     TASK_PREFIX, find_first_descent_point, argmin
 from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor, Block, split_into_blocks, \
     text_to_pieces
@@ -30,8 +29,7 @@ from recipe.mixed_train.step_localization import localize_first_error_chat
 from verl import DataProto
 from verl.protocol import unpad_dataproto, pad_dataproto_to_divisor
 from verl.single_controller.ray import RayClassWithInitArgs, create_colocated_worker_cls, RayWorkerGroup
-from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss, AdvantageEstimator
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -43,11 +41,12 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask, ResourcePoolManager, WorkerType,
 )
+from verl.trainer.ppo.utils import Role
 from verl.utils import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.torch_functional import pad_sequence_to_length
-from verl.utils.tracking import ValidationGenerationsLogger
+
 
 def pad_sequence_to_length_with_trunc(tensors, max_seq_len, pad_token_id, left_pad=False):
     """
@@ -60,17 +59,6 @@ def pad_sequence_to_length_with_trunc(tensors, max_seq_len, pad_token_id, left_p
     # (0, max_seq_len - tensors.shape[-1]) means right pad to max_seq_length and no left pad
     pad_tuple = (max_seq_len - tensors.shape[-1], 0) if left_pad else (0, max_seq_len - tensors.shape[-1])
     return F.pad(tensors, pad_tuple, "constant", pad_token_id)
-
-class Role(Enum):
-    Actor = 0
-    Rollout = 1
-    ActorRollout = 2
-    Critic = 3
-    RefPolicy = 4
-    RewardModel = 5
-    ActorRolloutRef = 6
-    EmbeddingWorker = 7
-    SEWorker = 8
 
 def get_embeddings_via_server(texts, base_url="http://127.0.0.1:8005/v1",
                               model_name="qwen3-embed-4b", api_key="secret-embed-key"):
@@ -290,22 +278,12 @@ class RayMixedTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
-    def __init__(
-        self,
-        config,
-        tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
-        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-        processor=None,
-        reward_fn=None,
-        val_reward_fn=None,
-        train_dataset: Optional[Dataset] = None,
-        val_dataset: Optional[Dataset] = None,
-        collate_fn=None,
-        train_sampler: Optional[Sampler] = None,
-        device_name="cuda",
-    ):
+
+    def __init__(self, config, tokenizer, role_worker_mapping: dict[Role, WorkerType],
+                 resource_pool_manager: ResourcePoolManager,
+                 ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup, processor=None, reward_fn=None,
+                 val_reward_fn=None, train_dataset: Optional[Dataset] = None, val_dataset: Optional[Dataset] = None,
+                 collate_fn=None, train_sampler: Optional[Sampler] = None, device_name=None):
         """
         Initialize distributed PPO trainer with Ray backend.
         Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -323,60 +301,147 @@ class RayMixedTrainer(RayPPOTrainer):
             val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
             collate_fn: Function to collate data samples into batches.
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
-            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to "cuda".
+            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
         """
+        super().__init__(config, tokenizer, role_worker_mapping, resource_pool_manager, ray_worker_group_cls, processor,
+                         reward_fn, val_reward_fn, train_dataset, val_dataset, collate_fn, train_sampler, device_name)
+        self.actor_rollout_wg = None
+        self.rm_wg = None
+        self.critic_wg = None
+        self.ref_policy_wg = None
+        self.embedding_wg = None
+        self.se_rollout_wg = None
 
-        # Store the tokenizer for text processing
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.config = config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
+    def init_workers(self):
+        """Initialize distributed training workers using Ray backend.
 
-        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"
+        Creates:
+        1. Ray resource pools from configuration
+        2. Worker groups for each role (actor, critic, etc.)
+        """
+        self.resource_pool_manager.create_resource_pool()
 
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        # create actor and rollout
         if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
-
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
-        self.use_rm = Role.RewardModel in role_worker_mapping
-        self.ray_worker_group_cls = ray_worker_group_cls
-        self.device_name = device_name
-        self.validation_generations_logger = ValidationGenerationsLogger()
-
-        # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
-
-        # define in-reward KL control
-        # kl loss control currently not suppoorted
-        if self.config.algorithm.use_kl_in_reward:
-            self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
-
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
-            self.use_critic = True
-        elif self.config.algorithm.adv_estimator in [
-            AdvantageEstimator.GRPO,
-            AdvantageEstimator.GRPO_PASSK,
-            AdvantageEstimator.REINFORCE_PLUS_PLUS,
-            AdvantageEstimator.REMAX,
-            AdvantageEstimator.RLOO,
-            AdvantageEstimator.OPO,
-            AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GPG,
-        ]:
-            self.use_critic = False
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            actor_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.ActorRollout),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
         else:
             raise NotImplementedError
 
-        self._validate_config()
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        # create critic
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+        # create reference policy if needed
+        if self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.RefPolicy),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+
+        # create a reward model if reward_fn is None
+        if self.use_rm:
+            # we create a RM here
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
+
+        # 新添加的内容
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.EmbeddingWorker)
+        emb_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.EmbeddingWorker],
+                                       config=self.config.embedding_worker)
+        self.resource_pool_to_cls[resource_pool][str(Role.EmbeddingWorker)] = emb_cls
+
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.SEWorker)
+        se_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.SEWorker], config=self.config.se_rollout_worker)
+        self.resource_pool_to_cls[resource_pool][str(Role.SEWorker)] = se_cls
+
+        # initialize WorkerGroup
+        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
+        # you should not use `create_colocated_worker_cls`.
+        # Instead, directly pass different resource pool to different worker groups.
+        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        all_wg = {}
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
+        wg_kwargs["worker_env"] = {
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            # "VLLM_USE_RAY_SPMD_WORKER": "1",
+        }
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            assert not torch.cuda.is_initialized(), "CUDA was initialized too early!"
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        self.embedding_wg = all_wg[str(Role.EmbeddingWorker)]
+        self.embedding_wg.init_model()
+
+        if self.use_critic:
+            self.critic_wg = all_wg[str(Role.Critic)]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
+            self.ref_policy_wg.init_model()
+
+        self.rm_wg = None
+        # initalization of rm_wg will be deprecated in the future
+        if self.use_rm:
+            self.rm_wg = all_wg[str(Role.RewardModel)]
+            self.rm_wg.init_model()
+
+        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
+        self.actor_rollout_wg.init_model()
+
+        self.se_rollout_wg = all_wg[str(Role.SEWorker)]
+        self.se_rollout_wg.init_model()
+
+        # create async rollout manager and request scheduler
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            from verl.experimental.agent_loop import AgentLoopManager
+
+            self.async_rollout_mode = True
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
+            )
 
     def localize_error_by_emb(self, blocks: list[list[Block]], complete_answers: list[str]) -> list[
         list[Any] | list[tuple[int, int]]]:
-
         # 获取steps对应的texts
         steps_list: list = []
         ref_steps_list = []
@@ -503,137 +568,6 @@ class RayMixedTrainer(RayPPOTrainer):
                 continue
             error_blocks.append(block_list[err_idx_list[i]])
         return error_blocks
-
-    def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
-
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
-        """
-        self.resource_pool_manager.create_resource_pool()
-
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
-            )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cfg = omega_conf_to_dataclass(self.config.critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
-                role="ref",
-            )
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
-
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.SEWorker)
-        se_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.SEWorker], config=self.config.se_rollout_worker)
-        self.resource_pool_to_cls[resource_pool]["se"] = se_cls
-
-        # 新添加的内容
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.EmbeddingWorker)
-        emb_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.EmbeddingWorker], config=self.config.embedding_worker)
-        emb_runtime_env = {
-            "runtime_env": {
-                "env_vars": {
-                    "VLLM_USE_V1": "0",  # embed task needs V0
-                    "TOKENIZERS_PARALLELISM": "true",
-                    "NCCL_DEBUG": "WARN",
-                    "VLLM_LOGGING_LEVEL": "WARN",
-                }
-            }
-        }
-        emb_cls.update_options(emb_runtime_env)
-
-        self.resource_pool_to_cls[resource_pool]["emb"] = emb_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
-            assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                    is not None
-            ), "worker_nsight_options must be set when profile_steps is set"
-            wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-            )
-        wg_kwargs["device_name"] = self.device_name
-
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
-            )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
-
-        if self.use_critic:
-            self.critic_wg = all_wg["critic"]
-            self.critic_wg.init_model()
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            self.ref_policy_wg.init_model()
-
-        if self.use_rm:
-            self.rm_wg = all_wg["rm"]
-            self.rm_wg.init_model()
-
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
-        self.actor_rollout_wg.init_model()
-
-        self.embedding_wg = all_wg["emb"]
-        self.embedding_wg.init_model()
-
-        self.se_rollout_wg = all_wg["se"]
-        self.se_rollout_wg.init_model()
-
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
-        if self.config.actor_rollout_ref.rollout.mode == "async":
-            from verl.experimental.agent_loop import AgentLoopManager
-
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AgentLoopManager(
-                config=self.config,
-                worker_group=self.actor_rollout_wg,
-            )
 
     def divide_answers_blocks(self, data: DataProto, reward_tensor=None, eos_probs=None):
         """

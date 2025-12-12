@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from verl.workers.config import FSDPActorConfig, RolloutConfig
 
@@ -35,5 +35,3 @@ class MixedTrainActorConfig(FSDPActorConfig):
 @dataclass
 class MixedTrainRolloutConfig(RolloutConfig):
     n_off_policy: int = 0
-    self_explain: dict = field(default_factory=lambda: {"max_tokens": 100, "max_blocks_num": 5})
-    chunk_size: int = 8
