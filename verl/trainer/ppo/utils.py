@@ -35,8 +35,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
-    EmbeddingWorker = 7
-    SEWorker = 8
+    Env = 7
 
     def __str__(self):
         return self._get_role_string()
@@ -50,8 +49,6 @@ class Role(Enum):
             Role.RefPolicy: "ref",
             Role.RewardModel: "rm",
             Role.ActorRolloutRef: "actor_rollout_ref",
-            Role.EmbeddingWorker: "emb",
-            Role.SEWorker: "se",
         }
         return role_mapping.get(self, self.name.lower())
 
@@ -65,8 +62,6 @@ class Role(Enum):
             "ref": cls.RefPolicy,
             "rm": cls.RewardModel,
             "actor_rollout_ref": cls.ActorRolloutRef,
-            "emb": cls.EmbeddingWorker,
-            "se": cls.SEWorker,
         }
         role = string_mapping.get(name.lower())
         if role is None:
@@ -78,7 +73,7 @@ def need_reference_policy(
     role_worker_mapping: dict[Role, WorkerType],
 ) -> bool:
     """Given a role worker mapping, do we need ref policy."""
-    return Role.RefPolicy in role_worker_mapping
+    return Role.RefPolicy in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping
 
 
 def need_reward_model(
