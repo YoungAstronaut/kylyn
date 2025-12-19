@@ -552,23 +552,10 @@ def build_high_entropy_blocks_tensor(
         # 获取当前序列的有效部分
         valid_indices = attention_mask[i].nonzero(as_tuple=True)[0]
         if valid_indices.numel() == 0:
-            print('this answer found right')
+            print(f"{i} th answer found right")
             results.append([])
             continue
-        # print('-----------')
-
-        # print(''.join(tokens[i]))
-        # print(f' length of tokens: {len(tokens[i])}, length of valid_indices: {valid_indices.numel()}')
-        # try:
         seq_tokens = tokens[i]
-        # except IndexError as e:
-        #     print(e)
-        #     print(f'valid_indices: {len(valid_indices)} ', (valid_indices.tolist()))
-        #     print(f'tokens: {len(tokens)} ', tokens[i])
-        #     seq_tokens = [responses[i][j] for j in valid_indices.cpu().numpy()]
-        #     seq_tokens = [tokenizer.decode(token, skip_special_tokens=True) for token in seq_tokens]
-        #     print(seq_tokens)
-        #     exit(1)
         seq_entropies = entropies[i][:len(seq_tokens)]
         assert len(seq_tokens) == seq_entropies.size(0), "tokens 和 entropies 形状应该一致"
 
@@ -855,10 +842,6 @@ def split_into_blocks(complete_sentence: str, tokens: list[str], max_span: int):
     :return:
     '''
     sentences_splits = split_sentences(complete_sentence)
-    # for i, split in enumerate(sentences_splits):
-    #     print('--------------')
-    #     print([split[1]])
-    # print(f'length of tokens: {len(tokens)}')
     text_splits = []
     for split in sentences_splits:
         if split[0] == 'text':
@@ -866,8 +849,6 @@ def split_into_blocks(complete_sentence: str, tokens: list[str], max_span: int):
     # print('length of all blocks: ', len(sentences_splits))
     # print('length of text blocks: ', len(text_splits))
     step_blocks = locate_substrings(tokens, text_splits)
-    # for k, v in step_blocks:
-    #     print('******', v)
 
     assert len(step_blocks) == len(text_splits), f'step_blocks:\n {step_blocks} \n text_splits:\n {text_splits}\n tokens: \n {tokens}'
 
@@ -1123,12 +1104,21 @@ def _process_single_sequence(
         probs = []
         for i in range(len(segments)):
             start, end = segments[i] # start, end是左闭右开区间
-            if i == 0:
-                probs.append((0, eos_prob_list[end-1]))
-            elif i == len(segments)-1:
-                probs.append((eos_prob_list[start], 0))
-            else:
-                probs.append((eos_prob_list[start], eos_prob_list[end-1]))
+            try:
+                if i == 0:
+                    probs.append((0, eos_prob_list[end-1]))
+                elif i == len(segments)-1:
+                    probs.append((eos_prob_list[start], 0))
+                else:
+                    probs.append((eos_prob_list[start], eos_prob_list[end-1]))
+            except IndexError as e:
+                print("[ERROR]", e)
+                print("[ERROR] eos_prob_list shape: ", eos_prob_list.shape)
+                print("[ERROR] start: ", start, " end: ", end)
+                segments = segments[:i+1]
+                probs.append((0, 0))
+                break
+
         segments, texts_splits = merge_segments_by_prob(segments, texts_splits, probs)
 
         for segment, text in zip(segments, texts_splits):

@@ -12,6 +12,7 @@ from pprint import pprint
 from typing import Optional, Any, Tuple
 
 import numpy as np
+import ray
 import torch
 from datasets import Dataset
 from omegaconf import OmegaConf
@@ -23,6 +24,7 @@ from tqdm import tqdm
 
 from recipe.mixed_train.embed_utils import balance_embeddings_batch, \
     TASK_PREFIX, find_first_descent_point, argmin
+from recipe.mixed_train.se_rollout_worker import SELoopManager
 from recipe.mixed_train.semantic_blocks import build_high_entropy_blocks_tensor, Block, split_into_blocks, \
     text_to_pieces
 from recipe.mixed_train.step_localization import localize_first_error_chat
@@ -40,6 +42,7 @@ from verl.trainer.ppo.ray_trainer import (
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask, ResourcePoolManager, WorkerType,
+    compute_reward
 )
 from verl.trainer.ppo.utils import Role
 from verl.utils import omega_conf_to_dataclass
@@ -248,30 +251,36 @@ def localize_error_by_llm(
     return error_blocks, re_verified_true, llm_results
 
 def construct_explain_prompt(question: str, standard_answer: str, answer_prefix: str):
+    # chat = [
+    #     {
+    #         "content": f"Your task is to understand a given standard problem-solving process of a given question, "
+    #                    f"then finish an incomplete reasoning process. The question is :\n{question}\nThe standard "
+    #                    f"solving process is as followings: \n\"\n{standard_answer}\n\"\n",
+    #         "role": "system"
+    #     },
+    #     {
+    #         "content": f"**Finish the following incomplete answer**: \n{answer_prefix}",
+    #         "role": "user"
+    #     }
+    # ]
     chat = [
         {
-            "content": f"Your task is to understand a given standard problem solving process of a given question, "
-                       f"then finish an incomplete reasoning process. The question is :\n{question}\nThe standard "
-                       f"solving process is as followings: \n\"\n{standard_answer}\n\"\n",
+            "content": (
+                f"Continue the incomplete reasoning below. First, identify the reasoning style and depth of the partial answer. "
+                f"Then complete it seamlessly, maintaining that exact style. You must: bridge all logical gaps, preserve any "
+                f"errors and continue their natural correction, and output the complete Thought (include original) and Solution in \\boxed{{}}."
+            ),
             "role": "system"
         },
         {
-            "content": f"**Finish the following incomplete answer**: \n{answer_prefix}",
+            "content": f"Problem:{question}\nReference Answer:{standard_answer}\nContinue this incomplete answer:\n{answer_prefix}",
             "role": "user"
         }
     ]
-    # custom_tmpl = """{%- for m in messages -%}
-    # {{ m['content'] }}
-    #
-    # {%- endfor -%}"""
-    #
-    # result = self.tokenizer.apply_chat_template(chat, add_generation_prompt=False, tokenize=False,
-    #                                             chat_template=custom_tmpl)
-    # print(chat)
-    result = chat[0]["content"]+" User: "+chat[1]["content"]
+    prompt = chat[0]["content"]+" User: "+chat[1]["content"]
     # k = result.replace('\n', '&&')
     # print(f' explain prompt: {k}')
-    return result
+    return prompt, chat
 
 
 class RayMixedTrainer(RayPPOTrainer):
@@ -305,6 +314,8 @@ class RayMixedTrainer(RayPPOTrainer):
         """
         super().__init__(config, tokenizer, role_worker_mapping, resource_pool_manager, ray_worker_group_cls, processor,
                          reward_fn, val_reward_fn, train_dataset, val_dataset, collate_fn, train_sampler, device_name)
+        self.async_se_rollout_manager = None
+        self.async_actor_rollout_manager = None
         self.actor_rollout_wg = None
         self.rm_wg = None
         self.critic_wg = None
@@ -366,7 +377,8 @@ class RayMixedTrainer(RayPPOTrainer):
         self.resource_pool_to_cls[resource_pool][str(Role.EmbeddingWorker)] = emb_cls
 
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.SEWorker)
-        se_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.SEWorker], config=self.config.se_rollout_worker)
+        se_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.SEWorker], role=str(Role.SEWorker),
+                                      config=self.config.se_rollout_worker)
         self.resource_pool_to_cls[resource_pool][str(Role.SEWorker)] = se_cls
 
         # initialize WorkerGroup
@@ -391,8 +403,7 @@ class RayMixedTrainer(RayPPOTrainer):
                 )
         wg_kwargs["device_name"] = self.device_name
         wg_kwargs["worker_env"] = {
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
-            # "VLLM_USE_RAY_SPMD_WORKER": "1",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:False",
         }
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
@@ -436,12 +447,32 @@ class RayMixedTrainer(RayPPOTrainer):
             from verl.experimental.agent_loop import AgentLoopManager
 
             self.async_rollout_mode = True
-            self.async_rollout_manager = AgentLoopManager(
-                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
+            if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
+                rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            else:
+                rm_resource_pool = None
+
+            self.async_actor_rollout_manager = AgentLoopManager(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rm_resource_pool=rm_resource_pool,
             )
 
+        self.async_se_rollout_mode = False
+        if self.config.se_loop_manager_config.actor_rollout_ref.rollout.mode == "async":
+            from verl.experimental.agent_loop import AgentLoopManager
+
+            self.async_se_rollout_mode = True
+
+            self.async_se_rollout_manager = SELoopManager(
+                config=self.config.se_loop_manager_config,
+                worker_group=self.se_rollout_wg,
+                rm_resource_pool=None,
+            )
+
+
     def localize_error_by_emb(self, blocks: list[list[Block]], complete_answers: list[str]) -> list[
-        list[Any] | list[tuple[int, int]]]:
+        None | tuple[int, int, int]]:
         # 获取steps对应的texts
         steps_list: list = []
         ref_steps_list = []
@@ -495,33 +526,6 @@ class RayMixedTrainer(RayPPOTrainer):
             if self.config.trainer.get("split_blocks", False):
                 raise NotImplementedError
                 # TODO: 目前的机制word_group里的句子数量不均等的时候容易卡死因此分块加速暂时不支持
-                # split_size: int = len(balanced_batch) // embedding_group_num + 1
-                # print('split size: ', split_size)
-                # batch_splits = [balanced_batch[i:i+split_size] for i in range(0, len(balanced_batch), split_size)]
-                # splits_sentences_num = []
-                # for split in batch_splits:
-                #     k = []
-                #     for t in split:
-                #         k.extend(t)
-                #     # print(f'length of this batch sentences: {len(k)}')
-                #     tokens_sum_this_batch = 0 # 统计一下总tokens数
-                #     sentences_num = 0 # 统计一下总句子数
-                #     for item in k:
-                #         texts = item["texts"]
-                #         print('texts length: ', len(texts))
-                #         sentences_num += len(texts)
-                #         for text in texts:
-                #             tokens_sum_this_batch += len(self.tokenizer.encode(text))
-                #             print(len(self.tokenizer.encode(text)))
-                #     print(f'sum of this batch sentences: {sentences_num}')
-                #     splits_sentences_num.append(sentences_num)
-                #     print(f'sum of this batch tokens: {tokens_sum_this_batch}')
-                #
-                # # 进行padding操作
-                # max_sentences_num = max(splits_sentences_num)
-                # for sentences_num, batch_split in zip(splits_sentences_num, batch_splits):
-                #     if sentences_num < max_sentences_num:
-                #         batch_split.append([{'pair_idx': -1, 'texts': ['pad text'] * (max_sentences_num - sentences_num)}])
             else:
                 batch_splits = [balanced_batch] * embedding_group_num
 
@@ -534,6 +538,7 @@ class RayMixedTrainer(RayPPOTrainer):
                 similarity_results = outputs[1]
 
             print('length of similarity results: ', len(similarity_results))
+            print("similarity results: ", similarity_results)
             print('empty similarity results: ', similarity_results.count({"scores": []}))
 
             for i, similarity_result in enumerate(similarity_results):
@@ -566,7 +571,9 @@ class RayMixedTrainer(RayPPOTrainer):
             if err_idx_list[i] == -1:
                 error_blocks.append(None)
                 continue
-            error_blocks.append(block_list[err_idx_list[i]])
+            # error_blocks.append(block_list[err_idx_list[i]])
+            get_block = block_list[err_idx_list[i]]
+            error_blocks.append((get_block.start, get_block.end, err_idx_list[i]))
         return error_blocks
 
     def divide_answers_blocks(self, data: DataProto, reward_tensor=None, eos_probs=None):
@@ -656,6 +663,7 @@ class RayMixedTrainer(RayPPOTrainer):
         print(f'sampled questions: {problems[0]}')
         responses = data.batch["responses"]
         explain_prompts = []
+        explain_prompts_chat = []
         answers_prefix = []
         first_incorrect_steps = []
         raw_target_prompts_selected = []
@@ -666,6 +674,7 @@ class RayMixedTrainer(RayPPOTrainer):
             if block is None:
                 continue
             start, end, index = block
+            print(f'block: {start}, {end}')
             if start == 0:
                 continue
             answer_prefix = self.tokenizer.decode(responses[i][:start])
@@ -675,7 +684,9 @@ class RayMixedTrainer(RayPPOTrainer):
             first_incorrect_steps.append(self.tokenizer.decode(responses[i][start:end], skip_special_tokens=True))
             raw_target_prompts_selected.append(raw_target_prompts[i])
             problems_selected.append(problems[i])
-            explain_prompts.append(construct_explain_prompt(problems[i], raw_target_prompts[i], answer_prefix))
+            explain_prompt, explain_chat = construct_explain_prompt(problems[i], raw_target_prompts[i], answer_prefix)
+            explain_prompts.append(explain_prompt)
+            explain_prompts_chat.append(explain_chat)
             raw_index.append(i)
 
         # print(f' sampled explain prompts: {explain_prompts[0]}')
@@ -706,162 +717,16 @@ class RayMixedTrainer(RayPPOTrainer):
             batch_size=explain_prompts_input_ids.shape[0],
         )
         non_tensor_batch = {
-                "answers_prefix": np.array(answers_prefix, dtype=object),
-                "problems": np.array(problems_selected, dtype=object),
-                "reference_answers": np.array(raw_target_prompts_selected, dtype=object),
-                "first_incorrect_steps": np.array(first_incorrect_steps, dtype=object),
-                "raw_index": np.array(raw_index, dtype=object),
-            }
+            "answers_prefix": np.array(answers_prefix, dtype=object),
+            "problems": np.array(problems_selected, dtype=object),
+            "reference_answers": np.array(raw_target_prompts_selected, dtype=object),
+            "first_incorrect_steps": np.array(first_incorrect_steps, dtype=object),
+            "raw_index": np.array(raw_index, dtype=object),
+            "raw_prompt": np.array(explain_prompts_chat, dtype=list)
+        }
         vllm_inputs = DataProto(batch, non_tensor_batch)
 
         return vllm_inputs
-
-    def gather_sft_blocks_input_embed(self, data: DataProto, error_blocks: list[list[int]]):
-        """
-        构造让模型生成下一个步骤的prompt
-        :param data: 完整数据，batch size 为 rollout 的次数，每一条 rollout 的数据对应若干个重要的需要重写的 block
-        :param error_blocks:
-        :return:
-        """
-        prompts_ids = data.batch["prompts"]
-        position_ids = data.batch["position_ids"]
-        advantages = data.batch["advantages"]
-        old_log_probs = data.batch["old_log_probs"]
-        raw_target_prompts = data.non_tensor_batch["raw_tgt_prompts"]
-        decoded_questions = self.tokenizer.batch_decode(prompts_ids, skip_special_tokens=True)
-        # print(f'sampled questions: {decoded_questions[0]}')
-        decoded_questions = [question.split('User: This is the problem:')[1].split('Assistant:')[0] for question in decoded_questions]
-        print(f'sampled questions:')
-        for question in decoded_questions[:10]:
-            print(question.replace('\n', ' '))
-
-        responses = data.batch["responses"]
-        batch_size = data.batch.batch_size[0]
-        total_nums = prompts_ids.shape[0]
-        print(f'total_nums: {total_nums}')
-
-        new_responses = []
-        tgt_responses = []
-        new_responses_mask = []
-        new_prompts_ids = []
-        new_position_ids = []
-        new_advantages = []
-        new_old_log_probs = []
-        answers_prefix = []
-        questions = []
-        raw_target_prompts_selected = []
-        max_blocks_num = self.config.actor_rollout_ref.rollout.self_explain.max_blocks_num
-        for i in range(batch_size):
-            if len(error_blocks[i]) == 0:
-                continue
-            # blocks_per_question = error_blocks[i] if len(error_blocks[i]) < max_blocks_num \
-            #     else error_blocks[i][:max_blocks_num]
-            blocks_per_question = error_blocks[i]
-            for block in blocks_per_question:
-                start = block[0]
-                if start == 0:
-                    continue
-                end = block[1]
-                new_responses.append(responses[i:i+1,:end])
-                new_responses_mask_item = torch.zeros_like(responses[i:i+1,...])
-                new_responses_mask_item[...,start:end] = 1
-                new_responses_mask.append(new_responses_mask_item)
-
-                tgt_responses.append(responses[i:i + 1, :start])
-
-                new_prompts_ids.append(prompts_ids[i:i+1,...])
-                new_position_ids.append(position_ids[i:i+1,...])
-                new_advantages.append(advantages[i:i+1,...])
-                new_old_log_probs.append(old_log_probs[i:i+1,...])
-                answers_prefix.append(self.tokenizer.decode(responses[i][:start]))
-                questions.append(decoded_questions[i])
-                raw_target_prompts_selected.append(raw_target_prompts[i])
-                assert answers_prefix[-1].strip() != "", \
-                    f"Answer prefix should not be empty {start}, {self.tokenizer.decode(responses[i])}"
-        explain_prompts = []
-        for i in range(len(questions)):
-            explain_prompts.append(construct_explain_prompt(questions[i], raw_target_prompts_selected[i],
-                                                            answers_prefix[i]))
-        # print(f' explain texts length: {len(explain_prompts)}')
-        # print(f' sampled explain prompts: {explain_prompts[0]}')
-        # print(f' sampled explain prompts: {explain_prompts[1]}')
-        explain_prompts_input_ids = \
-            [self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")['input_ids'] for prompt in
-             explain_prompts]
-        explain_prompts_attention_mask = \
-            [self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")['attention_mask'] for prompt in
-             explain_prompts]
-        max_input_ids_length = max([input_ids.shape[1] for input_ids in explain_prompts_input_ids])
-        # print(f'max input ids length: {max_input_ids_length}')
-        explain_prompts_input_ids = [
-            pad_sequence_to_length(prompt, max_input_ids_length, self.tokenizer.pad_token_id, left_pad=True)
-            for prompt in explain_prompts_input_ids]
-        explain_prompts_attention_mask = [
-            pad_sequence_to_length(prompt, max_input_ids_length, 0, left_pad=True) for prompt in
-            explain_prompts_attention_mask]
-
-        # if len(explain_prompts_input_ids) % self.config.actor_rollout_ref.rollout.chunk_size != 0:
-        #     pad_times = self.config.actor_rollout_ref.rollout.chunk_size - len(explain_prompts_input_ids) % \
-        #                                                                   self.config.actor_rollout_ref.rollout.chunk_size
-        if len(explain_prompts_input_ids) < total_nums:
-            pad_times = total_nums - len(explain_prompts_input_ids)
-            for i in range(pad_times):
-                explain_prompts_input_ids.append(torch.zeros_like(explain_prompts_input_ids[0]))
-                explain_prompts_attention_mask.append(torch.zeros_like(explain_prompts_attention_mask[0]))
-                new_responses.append(torch.zeros_like(responses[0:1,...]))
-                tgt_responses.append(torch.zeros_like(responses[0:1,...]))
-                new_responses_mask.append(torch.zeros_like(new_responses_mask[0]))
-                new_prompts_ids.append(torch.zeros_like(new_prompts_ids[0]))
-                new_advantages.append(torch.zeros_like(new_advantages[0]))
-                new_old_log_probs.append(torch.zeros_like(new_old_log_probs[0]))
-                answers_prefix.append('')
-                raw_target_prompts_selected.append('')
-                new_position_ids.append(torch.zeros_like(new_position_ids[0]))
-                questions.append('')
-        elif len(explain_prompts_input_ids) > total_nums:
-            explain_prompts_input_ids = explain_prompts_input_ids[:total_nums]
-            explain_prompts_attention_mask = explain_prompts_attention_mask[:total_nums]
-            new_responses = new_responses[:total_nums]
-            tgt_responses = tgt_responses[:total_nums]
-            new_responses_mask = new_responses_mask[:total_nums]
-            new_prompts_ids = new_prompts_ids[:total_nums]
-            new_advantages = new_advantages[:total_nums]
-            new_old_log_probs = new_old_log_probs[:total_nums]
-            answers_prefix = answers_prefix[:total_nums]
-            raw_target_prompts_selected = raw_target_prompts_selected[:total_nums]
-            new_position_ids = new_position_ids[:total_nums]
-            questions = questions[:total_nums]
-            pad_times = 0
-        else:
-            pad_times = 0
-        explain_prompts_input_ids = torch.cat(explain_prompts_input_ids, dim=0)
-        explain_prompts_attention_mask = torch.cat(explain_prompts_attention_mask, dim=0)
-        # print(f'input ids: {explain_prompts_input_ids}, shape: {explain_prompts_input_ids.shape}')
-        # print(f'attention mask: {explain_prompts_attention_mask}, shape: {explain_prompts_attention_mask.shape}')
-        assert explain_prompts_input_ids.shape == explain_prompts_attention_mask.shape, \
-            f"Input ids shape: {explain_prompts_input_ids.shape}, attention mask shape: {explain_prompts_attention_mask.shape}"
-
-        batch = TensorDict(
-            {
-                "input_ids": explain_prompts_input_ids,
-                "attention_mask": explain_prompts_attention_mask,
-                "response_mask": torch.cat(new_responses_mask, dim=0),
-                "prompts": torch.cat(new_prompts_ids, dim=0),
-                "position_ids": torch.cat(new_position_ids, dim=0),
-                "advantages": torch.cat(new_advantages, dim=0),
-                "old_log_probs": torch.cat(new_old_log_probs, dim=0),
-            },
-            batch_size=explain_prompts_input_ids.shape[0],
-        )
-        batch["tgt_attention_mask"] = torch.cat([(batch["prompts"] != self.tokenizer.pad_token_id).int()], dim=-1)
-        non_tensor_batch = {
-                "answers_prefix": np.array(answers_prefix, dtype=object),
-                "questions": np.array(questions, dtype=object),
-                "raw_target_prompts": np.array(raw_target_prompts_selected, dtype=object),
-            }
-        vllm_inputs = DataProto(batch, non_tensor_batch)
-
-        return vllm_inputs, new_responses, pad_times, tgt_responses
 
     def fit(self):
         """
@@ -926,11 +791,12 @@ class RayMixedTrainer(RayPPOTrainer):
                     )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
-                # print(f' new batch: {new_batch}')
+                print(f' new batch: {new_batch}')
                 num_gen_batches += 1
                 # pop those keys for generation
                 gen_batch = new_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
+                    non_tensor_batch_keys=["raw_prompt", "data_source", "reward_model", "ability", "extra_info"]
                 )
 
                 # interleave==True: [a, b] -> [a, a, b, b]
@@ -945,8 +811,13 @@ class RayMixedTrainer(RayPPOTrainer):
                 with ((marked_timer("step", timing_raw))):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        gen_batch_output: DataProto = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        # print(f'gen batch output: {gen_batch_output}')
+                        gen_batch_output: DataProto = self.async_actor_rollout_manager.generate_sequences(gen_batch)
+                        print(f'gen batch output: {gen_batch_output}')
+                        reward_extra_info = gen_batch_output.non_tensor_batch["reward_extra_info"]
+                        for extra_info in reward_extra_info:
+                            print(f"score: {extra_info['score']}, solution str: {extra_info['solution_str']}, "
+                                  f"ground truth: {extra_info['ground_truth']}")
+                            print(f"response str: {[extra_info['response_str']]}")
                         # 这一部分返回只有五项：
                         # prompts: Tensor(shape=torch.Size([24, 2048]),),
                         # responses: Tensor(shape=torch.Size([24, 20480]),),
@@ -1010,21 +881,20 @@ class RayMixedTrainer(RayPPOTrainer):
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
                         # print('use rm: ', self.use_rm)
-                        if self.use_rm:
+                        if self.use_rm and "rm_scores" not in new_batch.batch.keys():
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(new_batch)
                             new_batch = new_batch.union(reward_tensor)
 
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        reward_tensor, reward_extra_infos_dict = self.reward_fn(new_batch)
+                        reward_tensor, reward_extra_infos_dict = compute_reward(new_batch, self.reward_fn)
+
+                        if reward_extra_infos_dict:
+                            new_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                        print(f'reward_extra_infos_dict: ', reward_extra_infos_dict)
 
                         new_batch.batch["token_level_scores"] = reward_tensor
-
-                        # if reward_extra_infos_dict:
-                        #     new_batch.non_tensor_batch.update(
-                        #         {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                        #     )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1037,84 +907,54 @@ class RayMixedTrainer(RayPPOTrainer):
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
-                    if not self.config.algorithm.filter_groups.enable:
-                        batch = new_batch
-                    else:  # NOTE: When prompts after filtering is less than train batch size,
-                        # we skip to the next generation batch
-                        metric_name = self.config.algorithm.filter_groups.metric
-                        if metric_name == "seq_final_reward":
-                            # Turn to numpy for easier filtering
-                            new_batch.non_tensor_batch["seq_final_reward"] = (
-                                new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
+                    batch = new_batch
+                    if "response_mask" in batch.batch:
+                        batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Operating Mode Selection:
+                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode",
+                                                                                                  False)
+                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
+
+                        apply_rollout_correction(
+                            batch=batch,
+                            rollout_corr_config=rollout_corr_config,
+                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                        )
+                    else:  # Recompute old_log_probs
+                        print('use decoupled ppo strategy')
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            batch.meta_info.update({"eos_token_id": self.tokenizer.eos_token_id})
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            eos_prob = old_log_prob.batch["eos_prob"]
+                            print(f'eos shape: {eos_prob.shape}')
+                            actor_config = self.config.actor_rollout_ref.actor
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=actor_config.loss_agg_mode,
+                                loss_scale_factor=actor_config.loss_scale_factor,
                             )
-                        elif metric_name == "seq_reward":
-                            new_batch.non_tensor_batch["seq_reward"] = (
-                                new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
-                            )
+                            old_log_prob_metrics = {
+                                "actor/entropy": entropy_agg.detach().item(),
+                                "perf/mfu/actor_infer": old_log_prob_mfu,
+                            }
+                            metrics.update(old_log_prob_metrics)
+                            # old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
 
-                        # Collect the sequence reward for each trajectory
-                        prompt_uid2metric_vals = defaultdict(list)
-                        for uid, metric_val in zip(
-                            new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
-                        ):
-                            prompt_uid2metric_vals[uid].append(metric_val)
-
-                        prompt_uid2metric_std = {}
-                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
-
-                        kept_prompt_uids = [
-                            uid
-                            for uid, std in prompt_uid2metric_std.items()
-                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
-                        ]
-                        num_prompt_in_batch += len(kept_prompt_uids)
-
-                        kept_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in kept_prompt_uids:
-                                kept_traj_idxs.append(idx)
-
-                        new_batch = new_batch[kept_traj_idxs]
-                        batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
-
-                        prompt_bsz = self.config.data.train_batch_size
-                        if num_prompt_in_batch < prompt_bsz:
-                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
-                            max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
-                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
-                                print(f"{num_gen_batches=}. Keep generating...")
-                                progress_bar.update(1)
-                                continue
-                            else:
-                                raise ValueError(
-                                    f"{num_gen_batches=} >= {max_num_gen_batches=}."
-                                    + " Generated too many. Please check if your data are too difficult."
-                                    + " You could also try set max_num_gen_batches=0 to enable endless trials."
-                                )
-                        else:
-                            # Align the batch
-                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch = batch[:traj_bsz]
-
-                    # === Updating ===
-
-                    batch.batch["response_mask"] = compute_response_mask(batch)
-
-                    # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, "blue"):
-                        batch.meta_info.update({"eos_token_id": self.tokenizer.eos_token_id})
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        eos_prob = old_log_prob.batch["eos_prob"]
-                        print(f'eos shape: {eos_prob.shape}')
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        # old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                                metrics.update(calculate_debug_metrics(batch))
+                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     with marked_timer("blocks_division", timing_raw, "green"):
                         new_batch = self.divide_answers_blocks(new_batch, eos_probs=eos_prob)
@@ -1152,18 +992,20 @@ class RayMixedTrainer(RayPPOTrainer):
                         #     print(acc, '  ', llm_result)
 
                         # 统计每个样本的正确数
-                        acc = [1 if i else 0 for i in reward_extra_infos_dict["acc"]]
-                        acc = np.array(acc, dtype=object)
+                        # reward_extra_infos_dict["score"] 的格式是[-1,-1,...1]
+                        score = reward_extra_infos_dict["score"]
+                        score = np.where(score == -1, 0, score)
+                        print('score, ', score)
                         uid_list = list(set(new_batch.non_tensor_batch["uid"]))
                         print(f'uid list: {uid_list}')
                         id2correct_num = defaultdict(int)
                         for uid in uid_list:
-                            id2correct_num[uid] = acc[new_batch.non_tensor_batch["uid"] == uid].sum()
+                            id2correct_num[uid] = score[new_batch.non_tensor_batch["uid"] == uid].sum()
                         print(f'id2 correct num: {id2correct_num}')
 
                         # 每一条rollout数据附加一个新的关于正确数的字段
-                        reward_extra_infos_dict["correct_num"] = [0] * len(acc)
-                        for i in range(len(acc)):
+                        reward_extra_infos_dict["correct_num"] = [0] * len(score)
+                        for i in range(len(score)):
                             reward_extra_infos_dict["correct_num"][i] = id2correct_num[new_batch.non_tensor_batch["uid"][i]]
 
                         new_batch.non_tensor_batch["error_blocks"] = np.array(error_blocks, dtype=object)
@@ -1181,12 +1023,11 @@ class RayMixedTrainer(RayPPOTrainer):
                             print(f'{k}: {type(v)}')
 
                         tmp = new_batch.non_tensor_batch
-                        for i in range(len(acc)):
-                            print(f'{tmp["acc"][i]} {tmp["llm_results"][i]} {tmp["error_blocks"][i]} {tmp["correct_num"][i]} ')
+                        for i in range(len(score)):
+                            print(f'{tmp["score"][i]} {tmp["error_blocks"][i]} {tmp["correct_num"][i]} ')
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"],
-                                                                    dim=-1).tolist()
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1195,6 +1036,36 @@ class RayMixedTrainer(RayPPOTrainer):
                             batch = batch.union(ref_log_prob)
 
                     with marked_timer("adv", timing_raw, "brown"):
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        if (
+                            rollout_corr_config is not None
+                            and "rollout_log_probs" in batch.batch
+                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                        ):
+                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                            # Compute IS weights, apply rejection sampling, compute metrics
+                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            metrics.update(is_metrics)
+
+                        # compute advantages, executed on the driver process
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                            "norm_adv_by_std_in_grpo", True
+                        )  # GRPO adv normalization factor
+
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm["norm_adv_by_std_in_grpo"]
                         batch = compute_advantage(
@@ -1213,10 +1084,12 @@ class RayMixedTrainer(RayPPOTrainer):
                     with marked_timer("sft_blocks_prepare", timing_raw, "green"):
                         self_explain_inputs = self.gather_self_explain_input(batch, error_blocks)
                         print(f'self_explain_inputs: {self_explain_inputs}')
-                        self_explain_result: DataProto = self.se_rollout_wg.generate_se_blocks(self_explain_inputs)
+                        # self_explain_result: DataProto = self.se_rollout_wg.generate_se_blocks(self_explain_inputs)
+                        self_explain_result: DataProto = self.async_se_rollout_manager.generate_sequences(self_explain_inputs)
                         print(f'self_explain_result: {self_explain_result}')
+                        # self_explain_inputs = self_explain_inputs.union(self_explain_result)
 
-                        self_explain_samples_num = self_explain_result.batch['input_ids'].shape[0]
+                        self_explain_samples_num = self_explain_result.batch.batch_size[0]
                         valid_se_examples = []
                         for i in range(self_explain_samples_num):
                             response: torch.Tensor = self_explain_result.batch['responses'][i]
@@ -1231,8 +1104,8 @@ class RayMixedTrainer(RayPPOTrainer):
                         self_explain_result = self_explain_result.select_idxs(valid_se_examples)
                         self_explain_inputs_size = self_explain_result.batch['input_ids'].shape[0]
                         collected = []
-                        llm_client = OpenAI(base_url="https://api.vectorengine.ai/v1",
-                                            api_key="sk-PqqzpkgeXymtXSLepUSnK9XAuluuyEaRITaXjugJgm22fdwj")
+                        # llm_client = OpenAI(base_url="https://api.vectorengine.ai/v1",
+                        #                     api_key="sk-PqqzpkgeXymtXSLepUSnK9XAuluuyEaRITaXjugJgm22fdwj")
                         corrected_num = 0
                         for i in range(self_explain_inputs_size):
                             self_explain_prompt = self.tokenizer.decode(self_explain_inputs.batch['input_ids'][i],

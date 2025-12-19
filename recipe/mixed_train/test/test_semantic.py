@@ -13,20 +13,15 @@ from verl.utils import hf_tokenizer
 model_name: str = "../llm_models/Qwen/Qwen3-Embedding-8B"
 tokenizer_path = "../llm_models/Qwen/Qwen2.5-7B-Instruct"
 
-
-# TASK_PREFIX = (
-#     "Given a cumulative reasoning prefix, evaluate whether its semantic similarity "
-#     "to the reference solution drops compared to the previous prefix."
-# )
-
 # 移除顶层的 model 实例化
 print('PYTORCH_CUDA_ALLOC_CONF: ', os.environ.get("PYTORCH_CUDA_ALLOC_CONF", None))
 def main():
     # 将 model 实例化移到 main 函数内部
-    model = LLM(model=model_name, task="embed", tensor_parallel_size=1)  # 实际训练循环里可全局复用，不要反复构造
+    model = LLM(model=model_name, task="embed", tensor_parallel_size=1, enable_sleep_mode=True)  # 实际训练循环里可全局复用，不要反复构造
 
     # 注意：这里缺少了一些函数定义（find_first_descent_point, argmin, locate_bad_prefix_steps）
     # 请确保它们已在别处定义或在此函数内定义
+    model.sleep(1)
 
     with open('self_explain_examples/test/1.json', 'r') as f:
         data = json.load(f)
@@ -52,6 +47,7 @@ def main():
 
     num = 0
     num_fall = 0
+    model.wake_up()
     for example in false_examples:
         print('---------')
         steps = example['steps']

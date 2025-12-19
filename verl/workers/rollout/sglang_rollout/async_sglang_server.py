@@ -49,8 +49,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
-@ray.remote(num_cpus=1)
-class SGLangHttpServer:
+class SGLangHttpServerBase:
     """SGLang http server in single node, this is equivalent to launch server with command line:
     ```
     python -m sglang.launch_server --node-rank 0 --nnode 1 ...
@@ -287,6 +286,21 @@ class SGLangHttpServer:
             log_probs = None
         return TokenOutput(token_ids=token_ids, log_probs=log_probs)
 
+@ray.remote(num_cpus=1)
+class SGLangHttpServer(SGLangHttpServerBase):
+    def __init__(
+        self,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        rollout_mode: RolloutMode,
+        workers: list[ActorHandle],
+        replica_rank: int,
+        node_rank: int,
+        nnodes: int,
+        cuda_visible_devices: str,
+    ):
+        super().__init__(config, model_config, rollout_mode, workers, replica_rank,
+                         node_rank, nnodes, cuda_visible_devices)
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
 

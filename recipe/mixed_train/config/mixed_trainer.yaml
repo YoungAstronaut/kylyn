@@ -8,11 +8,16 @@ defaults:
 
 data:
   gen_batch_size: ${data.train_batch_size}
-  return_raw_chat: False
+  return_raw_chat: True
   filter_prompts: True
   max_target_length: 8192
   filter_targets: False
   sample_target_ratio: 1.0
+
+custom_reward_function:
+  custom_module: recipe.mixed_train.math_reward
+  name: math_verify_compute_score
+  path: recipe/mixed_train/math_reward.py
 
 reward_model:
   reward_manager: dapo
@@ -66,8 +71,8 @@ se_rollout_worker:
   nccl_timeout: 600
   rollout:
     _target_: recipe.mixed_train.mixed_train_config.MixedTrainRolloutConfig
-    name: sglang
-#    mode: async
+    name: se_sglang
+    mode: async
     enforce_eager: False
     free_cache_engine: True
     gpu_memory_utilization: 0.8
@@ -84,6 +89,31 @@ se_rollout_worker:
     data_parallel_size: 1
     pipeline_model_parallel_size: 1
     load_format: dummy
+    calculate_log_probs: False
+    prometheus:
+      _target_: verl.workers.config.PrometheusConfig
+      enable: False
+    agent:
+      _target_: verl.workers.config.AgentLoopConfig
+      default_agent_loop: single_turn_agent
+      num_workers: 1
+      agent_loop_config_path: null
+
+se_loop_manager_config:
+  data:
+    gen_batch_size: 1
+  trainer: 
+    n_gpus_per_node: ???
+    nnodes: ???
+  actor_rollout_ref: 
+    rollout:
+      _target_: recipe.mixed_train.mixed_train_config.MixedTrainRolloutConfig
+    model:
+      _target_: verl.workers.config.HFModelConfig
+  reward_model:
+    enable: False
+    enable_resource_pool: False
+    use_reward_loop: False
 
 algorithm:
   filter_groups:
@@ -96,7 +126,7 @@ actor_rollout_ref:
   rollout:
     _target_: recipe.mixed_train.mixed_train_config.MixedTrainRolloutConfig
     name: sglang
-#    mode: async
+    mode: async
     n_off_policy: 1
   actor:
     _target_: recipe.mixed_train.mixed_train_config.MixedTrainActorConfig

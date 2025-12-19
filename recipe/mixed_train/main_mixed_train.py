@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 
 from recipe.mixed_train.embedding_worker import EmbeddingWorker
 from recipe.mixed_train.se_rollout_worker import SERolloutWorker
+from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 
 from .mixed_ray_trainer import RayMixedTrainer, Role
@@ -19,13 +20,12 @@ from .mixed_ray_trainer import RayMixedTrainer, Role
 def main(config):
     run_ppo(config)
 
-
 def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         default_runtime_env = {
             "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN",
-                         "VLLM_USE_RAY_SPMD_WORKER": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+                         "VLLM_USE_RAY_SPMD_WORKER": "1",
                          }
         }
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
@@ -137,9 +137,22 @@ class TaskRunner:
 
         # Note(haibin.lin): please make sure custom reward managers are imported and
         # registered via `verl.workers.reward_manager.register`
-        from .math_reward import RuleBasedRewardManager
-        reward_fn = RuleBasedRewardManager(tokenizer=tokenizer, num_examine=0)
-        val_reward_fn = RuleBasedRewardManager(tokenizer=tokenizer, num_examine=1)
+        reward_fn = load_reward_manager(
+            config,
+            tokenizer,
+            0,
+            max_resp_len=config.data.max_response_length,
+            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+        )
+
+        # Note that we always use function-based RM for validation
+        val_reward_fn = load_reward_manager(
+            config,
+            tokenizer,
+            1,
+            max_resp_len=config.data.max_response_length,
+            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+        )
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
@@ -154,6 +167,10 @@ class TaskRunner:
             filter_targets=config.data.filter_targets,
             sample_target_ratio=config.data.sample_target_ratio,
         )
+        print('reward func: ', reward_fn)
+        config.se_loop_manager_config.actor_rollout_ref.rollout = config.se_rollout_worker.rollout
+        config.se_loop_manager_config.actor_rollout_ref.model = config.se_rollout_worker.model
+        config.se_loop_manager_config.trainer = config.trainer
         trainer = RayMixedTrainer(
             config=config,
             tokenizer=tokenizer,

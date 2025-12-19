@@ -3,13 +3,14 @@ from verl import DataProto
 import torch
 
 from recipe.mixed_train.utils import grade_answer_mathd, grade_answer_sympy
+from verl.workers.reward_manager.abstract import AbstractRewardManager
 
-def compute_score(
+def math_verify_compute_score(
     data_source,
     solution_str,
     ground_truth,
-    question=None,
     extra_info=None,
+    **kwargs
 ):
     """Compute the score for a given solution based on the data source.
 
@@ -26,7 +27,24 @@ def compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    def ground_truth_str(_ground_truth):
+        if isinstance(_ground_truth, (str, int, float)):
+            return str(_ground_truth)
+        elif isinstance(_ground_truth, list):
+            return ''.join([str(item) for item in _ground_truth])
+        else:
+            raise NotImplementedError
     res = -1.0
+    response_str = solution_str
+    solution_str = ""
+    if '<think>' in response_str and '</think>' in response_str:
+        solution_str = response_str.split('</think>')[1]
+    if '\\boxed' in response_str:
+        solution_str = last_boxed_only_string(response_str)
+    if solution_str == "":
+        return {"score": res, "response_str": response_str, "solution_str": solution_str,
+                "ground_truth": ground_truth_str(ground_truth)}
+
     if data_source == "openai/gsm8k":
         from verl.utils.reward_score import gsm8k
 
@@ -75,7 +93,8 @@ def compute_score(
                     break
                 else:
                     res = -1.0
-    return res
+    return {"score": res, "response_str": response_str, "solution_str": solution_str,
+            "ground_truth": ground_truth_str(ground_truth)}
 
 def last_boxed_only_string(string):
     idx = string.rfind("\\boxed")
@@ -103,7 +122,7 @@ def last_boxed_only_string(string):
         retval = string[idx:right_brace_idx + 1]
         return retval.replace('\\boxed{', '')[:-1]
 
-class RuleBasedRewardManager():
+class RuleBasedRewardManager(AbstractRewardManager):
     def __init__(
             self, 
             tokenizer, 
@@ -169,7 +188,7 @@ class RuleBasedRewardManager():
                 # print('response not contain solution: ')
                 # print('response: ', response_str)
             else:
-                result = compute_score(data_source, solution_str, ground_truth)
+                result = math_verify_compute_score(data_source, solution_str, ground_truth)
                 if isinstance(result, float):
                     score = result
                 elif isinstance(result, dict):
@@ -210,19 +229,20 @@ class RuleBasedRewardManager():
                 print("[score]", score)
 
         return reward_tensor, reward_extra_info
-    
-if __name__ == "__main__":
-    data_source = 'no_source'
-    response_str = '<think> I am omniscient. </think> The answer is \\boxed{24 + 14*x + (-13)*x^2 - 2*x^3 + x^4}.'
-    ground_truth=["10", "$x^{4}-2 x^{3}-13 x^{2}+14 x+24$"]
-    prompt_str = "Let $P(x)=x^{4}+2 x^{3}-13 x^{2}-14 x+24$ be a polynomial with roots $r_{1}, r_{2}, r_{3}, r_{4}$. Let $Q$ be the quartic polynomial with roots $r_{1}^{2}, r_{2}^{2}, r_{3}^{2}, r_{4}^{2}$, such that the coefficient of the $x^{4}$ term of $Q$ is 1. Simplify the quotient $Q\\left(x^{2}\\right) / P(x)$, leaving your answer in terms of $x$. (You may assume that $x$ is not equal to any of $\\left.r_{1}, r_{2}, r_{3}, r_{4}\\right)$." 
-    if '<think>' in response_str and '</think>' in response_str:
-        solution_str = response_str.split('</think>')[1]
-    if '\\boxed' in solution_str:
-        solution_str = last_boxed_only_string(solution_str)
-    
-    score = compute_score(data_source, solution_str, ground_truth)
-    score = compute_score(data_source, 'x^2 + 2x - 2', 'x^{2}+2x-2')
-    print(score)
-    test_str = "Thus, the original function's equation is \(\\boxed{y = x^2 + 2x - 2}\)."
-    print(last_boxed_only_string(test_str))
+
+
+# if __name__ == "__main__":
+#     data_source = 'no_source'
+#     response_str = '<think> I am omniscient. </think> The answer is \\boxed{24 + 14*x + (-13)*x^2 - 2*x^3 + x^4}.'
+#     ground_truth=["10", "$x^{4}-2 x^{3}-13 x^{2}+14 x+24$"]
+#     prompt_str = "Let $P(x)=x^{4}+2 x^{3}-13 x^{2}-14 x+24$ be a polynomial with roots $r_{1}, r_{2}, r_{3}, r_{4}$. Let $Q$ be the quartic polynomial with roots $r_{1}^{2}, r_{2}^{2}, r_{3}^{2}, r_{4}^{2}$, such that the coefficient of the $x^{4}$ term of $Q$ is 1. Simplify the quotient $Q\\left(x^{2}\\right) / P(x)$, leaving your answer in terms of $x$. (You may assume that $x$ is not equal to any of $\\left.r_{1}, r_{2}, r_{3}, r_{4}\\right)$."
+#     if '<think>' in response_str and '</think>' in response_str:
+#         solution_str = response_str.split('</think>')[1]
+#     if '\\boxed' in solution_str:
+#         solution_str = last_boxed_only_string(solution_str)
+#
+#     score = math_verify_compute_score(data_source, solution_str, ground_truth)
+#     score = math_verify_compute_score(data_source, 'x^2 + 2x - 2', 'x^{2}+2x-2')
+#     print(score)
+#     test_str = "Thus, the original function's equation is \(\\boxed{y = x^2 + 2x - 2}\)."
+#     print(last_boxed_only_string(test_str))

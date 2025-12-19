@@ -1,6 +1,6 @@
 from verl import DataProto
 from verl.utils import omega_conf_to_dataclass
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
+from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
 import logging
 import os
 
@@ -23,7 +23,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
-class MixedTrainActorRefWorker(ActorRolloutRefWorker):
+class MixedTrainActorRefWorker(AsyncActorRolloutRefWorker):
 
     def __init__(self, config: DictConfig, role: str, **kwargs):
         super().__init__(config, role, **kwargs)
