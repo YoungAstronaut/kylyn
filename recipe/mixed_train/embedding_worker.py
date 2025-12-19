@@ -1,26 +1,22 @@
 import datetime
-import inspect
 import logging
 import os
 
-import ray
 import torch
 import torch.distributed
 
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils import hf_tokenizer
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_name,
-    get_nccl_backend, get_torch_device,
+    get_nccl_backend,
 )
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, log_gpu_memory_usage
-from verl.utils.ray_utils import get_event_loop
 from verl.workers.fsdp_workers import create_device_mesh
 
 logger = logging.getLogger(__file__)
@@ -62,7 +58,7 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
 
         self.max_blocks_num = self.config.model.get("max_blocks_num", 8)
 
-        self.sleep_level = VLLM_SLEEP_LEVEL
+        self.sleep_level = 1
 
         self.gen_random_states = None
 
@@ -70,7 +66,6 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
         print(f"[Worker PID {os.getpid()}] 进程启动后第一条日志")
         print(f"[Worker PID {os.getpid()}] PYTORCH_CUDA_ALLOC_CONF: {os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
         print(f"[Worker PID {os.getpid()}] torch.cuda.is_initialized(): {torch.cuda.is_initialized()}")
-
 
         # the following line is necessary
         use_shm = config.model.get("use_shm", False)
@@ -93,22 +88,23 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
             task='embed',
+            seed=self.config.get("seed", 0)
         )
         print(f"[{os.getpid()}] LLM initialization completed!")
 
-    async def fall_into_sleep(self):
+    def fall_into_sleep(self):
         if self.config.free_cache_engine:
             log_gpu_memory_usage("Before embedding model offload", logger=logger)
-            await self.release()
+            self.release()
             log_gpu_memory_usage("After embedding model offload", logger=logger)
 
         aggressive_empty_cache(force_sync=True)
 
-    async def wake_up(self):
+    def wake_up(self):
         aggressive_empty_cache(force_sync=True)
         if self.config.free_cache_engine:
             log_gpu_memory_usage("Before embedding model wake up", logger=logger)
-            await self.resume(tags=["weights", "kv_cache"])
+            self.resume()
             log_gpu_memory_usage("After embedding model wake up", logger=logger)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -116,27 +112,18 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self._build_model(config=self.config)
-        loop = get_event_loop()
-        loop.run_until_complete(self.fall_into_sleep())
+        self.fall_into_sleep()
 
-    async def resume(self, tags: list[str]):
+    def resume(self):
         """Resume rollout weights or kv cache in GPU memory.
-
-        Args:
-            tags: weights or kv_cache.
         """
         if not self.config.free_cache_engine:
             return
 
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=tags)
-        else:
-            self.inference_engine.wake_up()
+        self.inference_engine.wake_up()
 
-    async def release(self):
+    def release(self):
         """Release weights and kv cache in GPU memory."""
-        self.inference_engine.reset_prefix_cache()
-
         if not self.config.free_cache_engine:
             return
 
@@ -150,6 +137,7 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
         for data_item in data:
             steps_data_list.extend(data_item)
         print('length of steps_data_list: ', len(steps_data_list))
+        self.wake_up()
 
         steps_data_length = []
         all_input_texts = []
@@ -183,4 +171,5 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
             scores_list.append({"scores": scores.values.tolist(), "extra_info": steps_data.copy()})
             offset += m + k
         assert offset == len(all_input_texts)
+        self.fall_into_sleep()
         return scores_list
