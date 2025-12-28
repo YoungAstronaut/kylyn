@@ -38,12 +38,15 @@ def math_verify_compute_score(
     response_str = solution_str
     solution_str = ""
     if '<think>' in response_str and '</think>' in response_str:
-        solution_str = response_str.split('</think>')[1]
+        response_str = response_str.split('</think>')[1]
     if '\\boxed' in response_str:
         solution_str = last_boxed_only_string(response_str)
+    else:
+        return {"score": res, "response_str": response_str, "solution_str": solution_str,
+                "ground_truth": ground_truth_str(ground_truth), "error_type": "format_error"}
     if solution_str == "":
         return {"score": res, "response_str": response_str, "solution_str": solution_str,
-                "ground_truth": ground_truth_str(ground_truth)}
+                "ground_truth": ground_truth_str(ground_truth), "error_type": "incorrect_answer"}
 
     if data_source == "openai/gsm8k":
         from verl.utils.reward_score import gsm8k
@@ -94,7 +97,7 @@ def math_verify_compute_score(
                 else:
                     res = -1.0
     return {"score": res, "response_str": response_str, "solution_str": solution_str,
-            "ground_truth": ground_truth_str(ground_truth)}
+            "ground_truth": ground_truth_str(ground_truth), "error_type": "incorrect_answer"}
 
 def last_boxed_only_string(string):
     idx = string.rfind("\\boxed")

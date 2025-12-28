@@ -73,7 +73,7 @@ ray start --head
 sleep 30
 
 cd /home/jwangxgroup/yuhang/jyh/verl
-bash recipe/mixed_train/run_mixed_train_8b_qwen3_rl_1_sft_0.sh \
+bash recipe/mixed_train/run_mixed_train_7b_qwen2.5_base.sh \
   --devices 4 \
   --calculate_rl "$CALCULATE_RL" \
   --calculate_sft "$CALCULATE_SFT" \

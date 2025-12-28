@@ -132,11 +132,9 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE)
     @DistProfiler.annotate(color="brown")
     def calculate_similarity(self, data: list[list[dict]]):
-        print("calculate_similarity EmbeddingWorker PID", os.getpid(), "VLLM_USE_V1=", os.environ.get("VLLM_USE_V1"))
         steps_data_list = []
         for data_item in data:
             steps_data_list.extend(data_item)
-        print('length of steps_data_list: ', len(steps_data_list))
         self.wake_up()
 
         steps_data_length = []
@@ -149,7 +147,7 @@ class EmbeddingWorker(Worker, DistProfilerExtension):
                 all_input_texts.extend(steps_data["texts"])
         assert len(steps_data_length) == len(steps_data_list)
 
-        outputs = self.inference_engine.embed(all_input_texts)
+        outputs = self.inference_engine.embed(all_input_texts, use_tqdm=False)
         embeddings = torch.tensor([o.outputs.embedding for o in outputs])
 
         offset = 0

@@ -33,7 +33,7 @@ done
 
 calculate_rl_loss=${calculate_rl_loss:-"True"}
 calculate_sft_loss=${calculate_sft_loss:-"False"}
-sft_coef=${sft_coef:-"0.0"}
+sft_coef=2.0
 
 nnodes=1
 n_gpus_per_node=${devices_num}
@@ -55,8 +55,8 @@ output_path=$HOME/jyh/verl/output
 ######
 set -xeuo pipefail
 
-project_name=luffy
-experiment_name=mixed_sft_coef_0.051
+project_name=kyrie
+experiment_name=only_psft_2.0
 
 
 use_kl_in_reward=False
@@ -77,11 +77,11 @@ loss_agg_mode="token-mean"
 
 enable_filter_groups=False
 filter_groups_metric=acc
-train_prompt_bsz=32  # train_batch_size
-gen_prompt_bsz=8
+train_prompt_bsz=128  # train_batch_size
+gen_prompt_bsz=128
 n_resp_per_prompt=8
 n_off_policy=0
-ppo_mini_bsz=32
+ppo_mini_bsz=128
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}

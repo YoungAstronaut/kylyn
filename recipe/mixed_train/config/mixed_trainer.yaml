@@ -77,7 +77,7 @@ se_rollout_worker:
     free_cache_engine: True
     gpu_memory_utilization: 0.8
     log_prob_use_dynamic_bsz: True
-    prompt_length: 4096
+    prompt_length: 8192
     response_length: 256 # 这个就是模型self explain的长度
     skip_tokenizer_init: True
     tensor_model_parallel_size: 2
