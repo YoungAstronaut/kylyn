@@ -24,6 +24,8 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+
 import torch
 from torch import distributed as dist, Tensor
 from tensordict import TensorDict
@@ -194,7 +196,6 @@ def compute_token_mixed_policy_loss(
     assert log_prob.shape == advantages.shape,   f'log_prob shape {log_prob.shape} != advantages shape {advantages.shape}'
     assert log_prob.shape == eos_mask.shape,     f'log_prob shape {log_prob.shape} != eos_mask shape {eos_mask.shape}'
 
-    # print(f'shape of log_prob {log_prob.shape}')
     # 统一设备/类型的零
     valid_tokens = torch.sum(eos_mask).item()
     print(f"RL有效token数量: {valid_tokens}")
@@ -336,9 +337,6 @@ def rearrange_micro_batches_with_targets(
     else:
         raise ValueError("with_sft and with_rl cannot be both False")
     total_seqlen = seq_len_effective.sum().item()
-    print(f'total seq len {total_seqlen}')
-    # print(f'seq_len_effective: {seq_len_effective}')
-    # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
     if min_num_micro_batch is not None:
         # used to support pp
@@ -858,6 +856,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             "tgt_input_ids",
             "tgt_attention_mask",
             "tgt_responses",
+            "tgt_response_mask"
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -869,7 +868,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
             select_data.batch["on_policy_mask"] = torch.ones_like(select_data.batch["response_mask"])
         non_tensor_batch = select_data.non_tensor_batch
         # print(f' non tensors batch keys: {non_tensor_batch.keys()}')
-        # for k, v in batch.items():
+        # for k, v in select_data.batch.items():
         #     print(f'{k}: {v.shape}')
         # print(non_tensor_batch['uid'])
 
@@ -1010,9 +1009,10 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                 mini_batch_metrics = {}
 
+                # print("length of micro matches: ", len(micro_batches))
                 for index, micro_batch in enumerate(micro_batches):
                     micro_batch_metrics = {}
-                    # print(f'micro batch data: {data}')
+                    # print(f"micro batch data: {data}")
                     micro_batch = micro_batch.to(get_device_id())
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
@@ -1024,6 +1024,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
+                    # print("loss scaler factor: ", loss_scale_factor)
 
                     if calculate_sft_loss and calculate_rl_loss:
                         forward_batch_data = TensorDict(
@@ -1050,29 +1051,26 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                             'responses': model_inputs["responses"],
                             'old_log_probs': model_inputs["old_log_probs"],
                             'advantages': model_inputs["advantages"],
-                            'on_policy_mask': model_inputs["on_policy_mask"],},
+                            'on_policy_mask': torch.ones_like(model_inputs["response_mask"]).bool(),},
                             batch_size=batch_size,
                         )
                         forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
                         forward_batch_data['policy_mask'] = torch.ones_like(model_inputs["response_mask"]).bool()
                         advantages = forward_batch_data["advantages"]
                     elif calculate_sft_loss and not calculate_rl_loss:
-                        raise NotImplementedError
-                        # # 这个分支目前不会跑到
-                        # forward_batch_data = TensorDict(
-                        #     {'input_ids': data["tgt_input_ids"],
-                        #     'attention_mask': data["tgt_attention_mask"],
-                        #     'position_ids': data["position_ids"],
-                        #     'responses': data["tgt_responses"],},
-                        #     batch_size=data.batch_size,
-                        # )
-                        # forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
-                        # forward_batch_data['policy_mask'] = torch.zeros_like(data["tgt_responses"]).bool()
+                        forward_batch_data = TensorDict(
+                            {'input_ids': model_inputs["tgt_input_ids"],
+                            'attention_mask': model_inputs["tgt_attention_mask"],
+                            'position_ids': model_inputs["position_ids"],
+                            'responses': model_inputs["tgt_responses"],},
+                            batch_size=batch_size,
+                        )
+                        forward_batch_data['response_mask'] = forward_batch_data['attention_mask'][:, prompt_length:]
+                        forward_batch_data['policy_mask'] = torch.zeros_like(model_inputs["tgt_responses"]).bool()
                     else:
                         raise ValueError('both sft loss and rl loss are not calculated')
 
                     response_mask = forward_batch_data["response_mask"]
-                    on_policy_mask = forward_batch_data["on_policy_mask"]
                     # all return: (bsz, response_length)
 
                     calculate_entropy = False
@@ -1093,12 +1091,12 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     if calculate_sft_loss:
                         policy_mask = forward_batch_data['policy_mask']
                         sft_loss = compute_sft_loss(all_log_prob*(~policy_mask), response_mask*(~policy_mask))
-                        # print('sft loss: ', sft_loss)
                     else:
                         sft_loss = torch.tensor(0.0, device=get_device_id())
 
                     if calculate_rl_loss:
                         policy_mask = forward_batch_data['policy_mask']
+                        on_policy_mask = forward_batch_data["on_policy_mask"]
                         pg_loss, on_pg_loss, on_pg_clipfrac, ppo_kl, stats = compute_token_mixed_policy_loss(
                             old_log_prob=old_log_prob*policy_mask,
                             log_prob=all_log_prob*policy_mask,
@@ -1160,7 +1158,6 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         # compute policy loss
                         all_loss = all_loss - entropy_loss * entropy_coeff
 
-                    # print(f'all loss: {all_loss}')
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = all_loss * loss_scale_factor

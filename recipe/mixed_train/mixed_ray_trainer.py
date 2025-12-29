@@ -12,7 +12,6 @@ from pprint import pprint
 from typing import Optional, Any, Tuple
 
 import numpy as np
-import ray
 import torch
 from datasets import Dataset
 from omegaconf import OmegaConf
@@ -253,30 +252,52 @@ def localize_error_by_llm(
 def construct_explain_prompt(question: str, standard_answer: str, answer_prefix: str):
     # chat = [
     #     {
-    #         "content": f"Your task is to understand a given standard problem-solving process of a given question, "
-    #                    f"then finish an incomplete reasoning process. The question is :\n{question}\nThe standard "
-    #                    f"solving process is as followings: \n\"\n{standard_answer}\n\"\n",
+    #         "content": (
+    #             f"Continue the incomplete reasoning below. First, identify the reasoning style and depth of the partial answer. "
+    #             f"Then complete it seamlessly, maintaining that exact style. You must: bridge all logical gaps, preserve any "
+    #             f"errors and continue their natural correction, and output the complete Thought (include original) and Solution in \\boxed{{}}."
+    #         ),
     #         "role": "system"
     #     },
     #     {
-    #         "content": f"**Finish the following incomplete answer**: \n{answer_prefix}",
+    #         "content": f"Problem:{question}\nReference Answer:{standard_answer}\nContinue this incomplete answer:\n{answer_prefix}",
     #         "role": "user"
     #     }
     # ]
+    system_content = (
+        "You must continue an unfinished solution.\n"
+        "You are given PROBLEM, REFERENCE_ANSWER (correct final result), and an assistant prefix.\n"
+        "Output ONLY the continuation that should appear immediately after the prefix.\n"
+        "Do NOT repeat or paraphrase any part of the prefix. No headings, no extra text.\n"
+        "Use REFERENCE_ANSWER only as a hidden correctness target to steer the continuation; never mention it.\n"
+        "If the prefix contains a mistake, do not edit it; add a brief correction in the continuation and proceed."
+    )
     chat = [
-        {
-            "content": (
-                f"Continue the incomplete reasoning below. First, identify the reasoning style and depth of the partial answer. "
-                f"Then complete it seamlessly, maintaining that exact style. You must: bridge all logical gaps, preserve any "
-                f"errors and continue their natural correction, and output the complete Thought (include original) and Solution in \\boxed{{}}."
-            ),
-            "role": "system"
-        },
-        {
-            "content": f"Problem:{question}\nReference Answer:{standard_answer}\nContinue this incomplete answer:\n{answer_prefix}",
-            "role": "user"
-        }
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": (
+            f"PROBLEM:\n{question}\n\n"
+            f"REFERENCE_ANSWER:\n{standard_answer}\n\n"
+            "Continue from the assistant prefix below."
+        )},
+        {"role": "assistant", "content": answer_prefix},
     ]
+    # system_content = (
+    #     "You must complete an unfinished solution.\n"
+    #     "You are given PROBLEM, REFERENCE_ANSWER (correct final result), and INCOMPLETE_THOUGHT.\n"
+    #     "Output ONLY the missing continuation after INCOMPLETE_THOUGHT.\n"
+    #     "Do NOT repeat or rewrite INCOMPLETE_THOUGHT. No headings, no preface.\n"
+    #     "Use REFERENCE_ANSWER only to ensure the continuation reaches the correct result; never mention it.\n"
+    #     "If INCOMPLETE_THOUGHT has an error, correct it in the continuation and continue."
+    # )
+    # chat = [
+    #     {"role": "system", "content": system_content},
+    #     {"role": "user", "content": (
+    #         f"PROBLEM:\n{question}\n\n"
+    #         f"REFERENCE_ANSWER:\n{standard_answer}\n\n"
+    #         f"INCOMPLETE_THOUGHT:\n{answer_prefix}\n\n"
+    #         "Continue from the end of INCOMPLETE_THOUGHT."
+    #     )},
+    # ]
     prompt = chat[0]["content"]+" User: "+chat[1]["content"]
     # k = result.replace('\n', '&&')
     # print(f' explain prompt: {k}')
@@ -504,7 +525,7 @@ class RayMixedTrainer(RayPPOTrainer):
         finished_flag = False
         max_blocks_num = self.config.trainer.max_blocks_num
         while not finished_flag:
-            print('none count: ', aux_steps_list.count(None))
+            # print('none count: ', aux_steps_list.count(None))
             tmp_steps_list = []
             for i in range(len(aux_steps_list)):
                 if aux_steps_list[i] is not None:
@@ -517,7 +538,7 @@ class RayMixedTrainer(RayPPOTrainer):
 
             balanced_batch = balance_embeddings_batch(tmp_steps_list, ref_steps_list, TASK_PREFIX, tokenizer=self.tokenizer)
 
-            print('balanced batch num: ', len(balanced_batch))
+            # print('balanced batch num: ', len(balanced_batch))
             # for item in balanced_batch:
             #     print(item)
             embedding_group_num = self.embedding_wg.world_size
@@ -537,9 +558,9 @@ class RayMixedTrainer(RayPPOTrainer):
             else:
                 similarity_results = outputs[1]
 
-            print('length of similarity results: ', len(similarity_results))
-            print("similarity results: ", similarity_results)
-            print('empty similarity results: ', similarity_results.count({"scores": []}))
+            # print('length of similarity results: ', len(similarity_results))
+            # print("similarity results: ", similarity_results)
+            # print('empty similarity results: ', similarity_results.count({"scores": []}))
 
             for i, similarity_result in enumerate(similarity_results):
                 scores = similarity_result["scores"]
@@ -649,18 +670,69 @@ class RayMixedTrainer(RayPPOTrainer):
 
     def construct_sft_data_to_update(self, data: DataProto, self_explain_result: DataProto,
                                      error_blocks: list[Optional[tuple | None]]):
-        pass
+        # print("all data length: ", data.batch.batch_size[0])
+        # print("error blocks list length: ", self_explain_result.batch.batch_size[0])
+        raw_index_list = self_explain_result.non_tensor_batch["raw_index"].tolist()
+        prompts = data.batch["prompts"].clone()
+        attention_mask = data.batch["attention_mask"].clone()
+        responses = data.batch["responses"].clone()
+        zero_responses_mask = torch.zeros_like(responses)
+        responses_length = responses.shape[-1]
+        new_responses = self_explain_result.batch["responses"].clone()
+        new_responses_mask = self_explain_result.batch["response_mask"].clone()
 
-    def gather_self_explain_input(self, data: DataProto, error_blocks: list[Optional[tuple | None]]):
+        tgt_responses_list: list[Optional[torch.Tensor]] = [None] * data.batch.batch_size[0]
+        tgt_responses_mask_list: list[Optional[torch.Tensor]] = [None] * data.batch.batch_size[0]
+        for i, raw_index in enumerate(raw_index_list):
+            assert error_blocks[raw_index] is not None
+            start, end, _ = error_blocks[raw_index]
+            tgt_response: torch.Tensor = torch.cat([responses[raw_index][:start], new_responses[i]], dim=-1)
+            tgt_response_mask: torch.Tensor = torch.cat([zero_responses_mask[raw_index][:start],
+                                           new_responses_mask[i]], dim=-1)
+            tgt_responses_list[raw_index] = tgt_response
+            tgt_responses_mask_list[raw_index] = tgt_response_mask
+        assert  len(tgt_responses_list) == len(tgt_responses_mask_list)
+        for index in range(len(tgt_responses_list)):
+            if tgt_responses_list[index] is None:
+                tgt_responses_list[index] = responses[index].clone()
+                tgt_responses_mask_list[index] = zero_responses_mask[index].clone()
+            else:
+                tgt_responses_list[index] = pad_sequence_to_length(tgt_responses_list[index], responses_length,
+                                                              self.tokenizer.pad_token_id, left_pad=False)
+                tgt_responses_mask_list[index] = pad_sequence_to_length(tgt_responses_mask_list[index], responses_length,
+                                                                  0, left_pad=False)
+            # print("response shape: ", tgt_responses_list[index].shape)
+            # print("attention shape: ", tgt_responses_mask_list[index].shape)
+            # print("error block", error_blocks[index])
+            # print("valid num: ", tgt_responses_mask_list[index].sum())
+        tgt_responses_list = [each.unsqueeze(0) for each in tgt_responses_list]
+        tgt_responses_mask_list = [each.unsqueeze(0) for each in tgt_responses_mask_list]
+        tgt_responses = torch.cat(tgt_responses_list, dim=0)
+        tgt_response_mask = torch.cat(tgt_responses_mask_list, dim=0)
+        print("tgt_responses shape: ", tgt_responses.shape)
+        
+        tgt_input_ids = torch.cat([prompts, tgt_responses], dim=-1)
+        prompt_length = prompts.shape[-1]
+        tgt_attention_mask = torch.cat([attention_mask[:, :prompt_length], tgt_response_mask], dim=-1)
+        return DataProto.from_dict({
+            "tgt_input_ids": tgt_input_ids,
+            "tgt_attention_mask": tgt_attention_mask,
+            "tgt_responses": tgt_responses,
+            "tgt_response_mask": tgt_response_mask
+        })
+
+    def gather_self_explain_input(self, data: DataProto, error_blocks: list[Optional[tuple | None]],
+                                  error_type: list[str]):
         """
         构造让模型生成下一个步骤的prompt
+        :param error_type:
         :param data: 完整数据，batch size 为 rollout 的次数，每一条 rollout 的数据对应若干个重要的需要重写的 block
         :param error_blocks:
         :return:
         """
         raw_target_prompts = data.non_tensor_batch["raw_tgt_prompts"]
         problems = data.non_tensor_batch["problem"]
-        print(f'sampled questions: {problems[0]}')
+        # print(f'sampled questions: {problems[0]}')
         responses = data.batch["responses"]
         explain_prompts = []
         explain_prompts_chat = []
@@ -674,8 +746,7 @@ class RayMixedTrainer(RayPPOTrainer):
             if block is None:
                 continue
             start, end, index = block
-            print(f'block: {start}, {end}')
-            if start == 0:
+            if start == 0 or error_type[i] == "format_error":
                 continue
             answer_prefix = self.tokenizer.decode(responses[i][:start])
             assert answer_prefix.strip() != "", \
@@ -762,6 +833,7 @@ class RayMixedTrainer(RayPPOTrainer):
                 return
 
         # add tqdm
+        # self.total_training_steps = 40
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -791,7 +863,8 @@ class RayMixedTrainer(RayPPOTrainer):
                     )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
-                print(f' new batch: {new_batch}')
+                # print(f"new batch: {new_batch.batch}")
+                # print(f"non tensor keys: ", new_batch.non_tensor_batch.keys())
                 num_gen_batches += 1
                 # pop those keys for generation
                 gen_batch = new_batch.pop(
@@ -806,18 +879,27 @@ class RayMixedTrainer(RayPPOTrainer):
                     interleave=True
                 )
 
+                import copy
+                gen_batch_copy = copy.deepcopy(gen_batch)
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with ((marked_timer("step", timing_raw))):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
                         gen_batch_output: DataProto = self.async_actor_rollout_manager.generate_sequences(gen_batch)
-                        print(f'gen batch output: {gen_batch_output}')
+                        # print(f'gen batch output: {gen_batch_output}')
                         reward_extra_info = gen_batch_output.non_tensor_batch["reward_extra_info"]
+                        correct_num = 0
                         for extra_info in reward_extra_info:
-                            print(f"score: {extra_info['score']}, solution str: {extra_info['solution_str']}, "
-                                  f"ground truth: {extra_info['ground_truth']}")
-                            print(f"response str: {[extra_info['response_str']]}")
+                            if extra_info['score'] > 0:
+                                correct_num += 1
+                            # print(f"score: {extra_info['score']}, solution str: {extra_info['solution_str']}, "
+                            #       f"ground truth: {extra_info['ground_truth']}")
+                            # print(f"response str: {[extra_info['response_str']]}")
+                        pre_correct_ratio = correct_num / len(reward_extra_info)
+                        # print("pre correct ratio: ", pre_correct_ratio)
+                        metrics.update({"critic/acc/pre": pre_correct_ratio})
                         # 这一部分返回只有五项：
                         # prompts: Tensor(shape=torch.Size([24, 2048]),),
                         # responses: Tensor(shape=torch.Size([24, 20480]),),
@@ -825,7 +907,6 @@ class RayMixedTrainer(RayPPOTrainer):
                         # attention_mask: Tensor(shape=torch.Size([24, 22528]),),
                         # position_ids: Tensor(shape=torch.Size([24, 22528]),),
                         n_off_policy = self.config.actor_rollout_ref.rollout.n_off_policy
-                        # print(f'gen batch: {gen_batch_output.batch}')
                         if n_off_policy > 0:
                             required_keys = ["prompts", "responses", "input_ids", "attention_mask", "position_ids"]
                             assert all(key in gen_batch_output.batch for key in required_keys), "生成的序列数据缺少必要键"
@@ -892,7 +973,7 @@ class RayMixedTrainer(RayPPOTrainer):
 
                         if reward_extra_infos_dict:
                             new_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-                        print(f'reward_extra_infos_dict: ', reward_extra_infos_dict)
+                        # print(f'reward_extra_infos_dict: ', reward_extra_infos_dict)
 
                         new_batch.batch["token_level_scores"] = reward_tensor
 
@@ -927,14 +1008,12 @@ class RayMixedTrainer(RayPPOTrainer):
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
-                        print('use decoupled ppo strategy')
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             batch.meta_info.update({"eos_token_id": self.tokenizer.eos_token_id})
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             eos_prob = old_log_prob.batch["eos_prob"]
-                            print(f'eos shape: {eos_prob.shape}')
                             actor_config = self.config.actor_rollout_ref.actor
                             entropy_agg = agg_loss(
                                 loss_mat=entropys,
@@ -958,8 +1037,10 @@ class RayMixedTrainer(RayPPOTrainer):
 
                     with marked_timer("blocks_division", timing_raw, "green"):
                         new_batch = self.divide_answers_blocks(new_batch, eos_probs=eos_prob)
-                        print(f'finished get_answers_blocks')
-                        print(new_batch.non_tensor_batch["blocks"])
+                        # print(f'finished get_answers_blocks')
+                        steps_list = []
+                        for steps in new_batch.non_tensor_batch["blocks"].tolist():
+                            steps_list.append([step.text for step in steps])
 
                     with marked_timer("error_localization", timing_raw, "yellow"):
                         # error_blocks = filter_blocks_by_embedding(batch.non_tensor_batch["parsed_blocks"].tolist(),
@@ -986,7 +1067,7 @@ class RayMixedTrainer(RayPPOTrainer):
                         else:
                             error_blocks = self.localize_error_by_emb(new_batch.non_tensor_batch["blocks"].tolist(),
                                 new_batch.non_tensor_batch["raw_tgt_prompts"].tolist())
-                            print(f'error_blocks: {error_blocks}')
+                            # print(f'error_blocks: {error_blocks}')
 
                         # for llm_result, acc in zip(llm_results, reward_extra_infos_dict["acc"]):
                         #     print(acc, '  ', llm_result)
@@ -995,13 +1076,11 @@ class RayMixedTrainer(RayPPOTrainer):
                         # reward_extra_infos_dict["score"] 的格式是[-1,-1,...1]
                         score = reward_extra_infos_dict["score"]
                         score = np.where(score == -1, 0, score)
-                        print('score, ', score)
+                        # print('score, ', score)
                         uid_list = list(set(new_batch.non_tensor_batch["uid"]))
-                        print(f'uid list: {uid_list}')
                         id2correct_num = defaultdict(int)
                         for uid in uid_list:
                             id2correct_num[uid] = score[new_batch.non_tensor_batch["uid"] == uid].sum()
-                        print(f'id2 correct num: {id2correct_num}')
 
                         # 每一条rollout数据附加一个新的关于正确数的字段
                         reward_extra_infos_dict["correct_num"] = [0] * len(score)
@@ -1019,12 +1098,12 @@ class RayMixedTrainer(RayPPOTrainer):
                                 {k: np.array(v, dtype=object)
                                 if isinstance(v, list) else v for k, v in reward_extra_infos_dict.items()}
                             )
-                        for k, v in new_batch.non_tensor_batch.items():
-                            print(f'{k}: {type(v)}')
+                        # for k, v in new_batch.non_tensor_batch.items():
+                            # print(f'{k}: {type(v)}')
 
-                        tmp = new_batch.non_tensor_batch
-                        for i in range(len(score)):
-                            print(f'{tmp["score"][i]} {tmp["error_blocks"][i]} {tmp["correct_num"][i]} ')
+                        # tmp = new_batch.non_tensor_batch
+                        # for i in range(len(score)):
+                        #     print(f'{tmp["score"][i]} {tmp["error_blocks"][i]} {tmp["correct_num"][i]} ')
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1081,48 +1160,33 @@ class RayMixedTrainer(RayPPOTrainer):
                     # print(f' non tensors batch keys(): {batch.non_tensor_batch.keys()}')
                     # torch.save(batch.batch, os.path.join('entropy_examples', f'{self.global_steps}.pt'))
 
+                    sft_indexes = {}
                     with marked_timer("sft_blocks_prepare", timing_raw, "green"):
-                        self_explain_inputs = self.gather_self_explain_input(batch, error_blocks)
-                        print(f'self_explain_inputs: {self_explain_inputs}')
-                        # self_explain_result: DataProto = self.se_rollout_wg.generate_se_blocks(self_explain_inputs)
+                        error_type = batch.non_tensor_batch["error_type"]
+                        # print("error type: ", error_type)
+                        self_explain_inputs = self.gather_self_explain_input(batch, error_blocks, error_type)
+                        self_explain_samples_num = self_explain_inputs.batch.batch_size[0]
+                        self_explain_inputs.pop(batch_keys=["input_ids", "attention_mask"])
                         self_explain_result: DataProto = self.async_se_rollout_manager.generate_sequences(self_explain_inputs)
-                        print(f'self_explain_result: {self_explain_result}')
-                        # self_explain_inputs = self_explain_inputs.union(self_explain_result)
+                        self_explain_inputs.pop(non_tensor_batch_keys=["raw_prompt"])
+                        self_explain_result = self_explain_result.union(self_explain_inputs)
 
-                        self_explain_samples_num = self_explain_result.batch.batch_size[0]
-                        valid_se_examples = []
-                        for i in range(self_explain_samples_num):
-                            response: torch.Tensor = self_explain_result.batch['responses'][i]
-                            response_mask = (response != self.tokenizer.eos_token_id).int() * (response != self.tokenizer.eos_token_id).int()
-                            valid_tokens_num = response_mask.sum().item()
-                            if valid_tokens_num > 0:
-                                valid_se_examples.append(i)
-                            print(valid_tokens_num)
-                        print(f'valid se examples: {len(valid_se_examples)}, overall samples: {self_explain_samples_num}')
-                        print(f'valid examples: {valid_se_examples}')
-
-                        self_explain_result = self_explain_result.select_idxs(valid_se_examples)
-                        self_explain_inputs_size = self_explain_result.batch['input_ids'].shape[0]
                         collected = []
                         # llm_client = OpenAI(base_url="https://api.vectorengine.ai/v1",
                         #                     api_key="sk-PqqzpkgeXymtXSLepUSnK9XAuluuyEaRITaXjugJgm22fdwj")
-                        corrected_num = 0
-                        for i in range(self_explain_inputs_size):
-                            self_explain_prompt = self.tokenizer.decode(self_explain_inputs.batch['input_ids'][i],
-                                                                  skip_special_tokens=True)
-                            # print(f'prefix answer: {prefix_answer}')
-                            # print(f'self_explain_prompt: {self_explain_prompt}')
-                            # print_tensor(self_explain_result.batch['responses'][i])
-                            complete_answer = self.tokenizer.decode(self_explain_result.batch['responses'][i],
-                                                                    skip_special_tokens=True) # 模型生成的下一步的答案
-                            valid_num = self_explain_result.batch['attention_mask'][i].sum().item()
-                            tokens = text_to_pieces(complete_answer, self.tokenizer)
-                            _, complete_answer_splits = split_into_blocks(complete_answer, tokens, 192)
-                            print(f'complete answer: {complete_answer}')
-                            print(f'answer splits: {complete_answer_splits}')
-                            print(f'valid num: {valid_num}')
+                        for i in range(self_explain_samples_num):
                             answer_prefix = self_explain_inputs.non_tensor_batch['answers_prefix'][i]
                             first_incorrect_step = self_explain_inputs.non_tensor_batch['first_incorrect_steps'][i]
+                            self_explain_prompt = self.tokenizer.decode(self_explain_result.batch['input_ids'][i],
+                                                                  skip_special_tokens=True)
+                            complete_answer = self.tokenizer.decode(self_explain_result.batch['responses'][i],
+                                                                    skip_special_tokens=True)
+                            if answer_prefix.strip() in complete_answer: # 判断模型是否重复了一遍前缀
+                                complete_answer = complete_answer.replace(answer_prefix, "")
+                            valid_num = self_explain_result.batch['attention_mask'][i].sum().item()
+                            # print(f"complete answer: {complete_answer}")
+                            # print(f"answer splits: {complete_answer_splits}")
+                            # print(f"valid num: {valid_num}")
                             # if len(complete_answer_splits) > 0:
                             #     verdict = judge_candidate_step_chat(
                             #         problem=self_explain_inputs.non_tensor_batch['problems'][i],
@@ -1138,33 +1202,47 @@ class RayMixedTrainer(RayPPOTrainer):
                             #     verdict = {}
                             verdict = {}
 
-                            raw_index = self_explain_result.non_tensor_batch['raw_index'][i]
-                            llm_result = batch.non_tensor_batch['llm_results'][raw_index]
+                            raw_index = self_explain_inputs.non_tensor_batch['raw_index'][i]
+                            if raw_index in sft_indexes.keys():
+                                sft_indexes[raw_index] += 1
+                            else:
+                                sft_indexes[raw_index] = 1
+                            # llm_result = batch.non_tensor_batch['llm_results'][raw_index]
                             standard_answer = batch.non_tensor_batch['raw_tgt_prompts'][raw_index]
                             correct_num = batch.non_tensor_batch['correct_num'][raw_index]
                             collected.append({
                                 "self_explain_prompt": self_explain_prompt,  # 这个是有self explain的提示prompt的
-                                "complete_answer": complete_answer_splits,
+                                "complete_answer": complete_answer,
                                 "completed_tokens_num": valid_num,
                                 "answer_prefix": answer_prefix,
                                 "problem": self_explain_inputs.non_tensor_batch['problems'][i],
                                 "step_incorrect": {
                                     "step": first_incorrect_step,
-                                    "eval_result": llm_result
+                                    "eval_result": {}
                                 },
                                 "step_corrected": {
-                                    "step": complete_answer_splits[0],
+                                    # "step": complete_answer_splits[0],
                                     "eval_result": verdict
                                 },
                                 "answer_incorrect": answer_prefix + first_incorrect_step,
                                 "answer_corrected": answer_prefix + complete_answer,
                                 "standard_answer": standard_answer,
-                                "correct_num": correct_num
+                                "correct_num": correct_num,
+                                "steps": steps_list[raw_index]
                             })
-                        corrected_ratio = corrected_num / self_explain_inputs_size
-                        print(f'corrected_ratio: {corrected_ratio}')
                         with open(f'self_explain_examples/test/{self.global_steps}.json', 'w', encoding='utf-8') as f:
                             f.write(json.dumps(collected, ensure_ascii=False, indent=4))
+
+                        sft_data_to_update = self.construct_sft_data_to_update(batch, self_explain_result, error_blocks)
+                        batch.pop(batch_keys=["tgt_input_ids", "tgt_attention_mask", "tgt_responses"])
+                        sft_data_to_update = sft_data_to_update.union(batch)
+                        # tgt_responses = sft_data_to_update.batch["tgt_responses"]
+                        # tgt_response_mask = sft_data_to_update.batch["tgt_response_mask"]
+                        # batch_size = tgt_responses.shape[0]
+                        # for i in range(batch_size):
+                        #     sentence_tensor = tgt_responses[i][tgt_response_mask[i] == 1]
+                        #     sentence = self.tokenizer.decode(sentence_tensor, skip_special_tokens=True)
+                        #     print(f"tgt_response: {sentence}")
 
                         # Balance the number of valid tokens across DP ranks.
                         # NOTE: This usually changes the order of data in the `batch`,
@@ -1172,88 +1250,119 @@ class RayMixedTrainer(RayPPOTrainer):
                         # but might affect the loss calculation (due to the change of mini-batching).
                         # TODO: Decouple the DP balancing and mini-batching.
                         print(f'balancing batch: {self.config.trainer.balance_batch}')
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics)
-                        exit(0)
+                        # if self.config.trainer.balance_batch:
+                        #     self._balance_batch(batch, metrics=metrics)
 
-                        pad_length = sft_blocks_inputs.batch['response_mask'].shape[1]
-                        prompt_length = sft_blocks_inputs.batch['prompts'].shape[1]
+                    # prob_cal_data = DataProto.from_dict({
+                    #     "input_ids": sft_data_to_update.batch["tgt_input_ids"],
+                    #     "responses": sft_data_to_update.batch["tgt_responses"],
+                    #     "attention_mask": sft_data_to_update.batch["tgt_attention_mask"],
+                    #     "position_ids": sft_data_to_update.batch["position_ids"],
+                    # })
+                    # prob_cal_data.meta_info.update({"eos_token_id": self.tokenizer.eos_token_id})
+                    # prob_attention_mask = prob_cal_data.batch["attention_mask"][:, 1024:]
+                    #
+                    # with marked_timer("prob change evaluation", timing_raw, "red"):
+                    #     log_prob_before, _ = self._compute_old_log_prob(prob_cal_data)
+                    #     log_prob_before = log_prob_before.batch["old_log_probs"]
 
-                        # 用于强化学习的input_ids、attention_mask
-                        sft_blocks_inputs.batch['responses'] = torch.cat(
-                            [pad_sequence_to_length(response, pad_length, self.tokenizer.pad_token_id, left_pad=False)
-                             for response in incomplete_responses], dim=0
-                        )
-                        sft_blocks_inputs.batch['input_ids'] = torch.cat(
-                            [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['responses']], dim=1
-                        )
-                        sft_blocks_inputs.batch['attention_mask'] = torch.cat(
-                            [sft_blocks_inputs.batch['tgt_attention_mask'], sft_blocks_inputs.batch['response_mask']],
-                            dim=-1
-                        )
+                    # with marked_timer("dynamic sft", timing_raw, "red"):
+                    #     sft_data_to_update.meta_info = copy.deepcopy(batch.meta_info)
+                    #     sft_data_to_update.meta_info['calculate_rl_loss'] = True
+                    #     sft_data_to_update.meta_info['calculate_sft_loss'] = False
+                    #     sft_output = self.actor_rollout_wg.update_actor(sft_data_to_update)
 
-                        sft_blocks_inputs.batch['tgt_responses'] = torch.cat(
-                            [pad_sequence_to_length_with_trunc(
-                                torch.cat([response, self_explain_result.batch['responses'][idx:idx+1,...]], dim=-1),
-                                pad_length, self.tokenizer.pad_token_id, left_pad=False)
-                             for idx, response in enumerate(tgt_incomplete_responses)], dim=0
-                        )
-                        sft_blocks_inputs.batch['tgt_input_ids'] = torch.cat(
-                            [sft_blocks_inputs.batch["prompts"], sft_blocks_inputs.batch['tgt_responses']], dim=1
-                        )
-                        response_tgt_attention_mask = torch.zeros_like(sft_blocks_inputs.batch['response_mask'])
-                        for idx, response in enumerate(tgt_incomplete_responses):
-                            response_length = response.shape[-1]
-                            start = prompt_length+response_length
-                            end = start+self_explain_result.batch['attention_mask'][idx].sum().item()
-                            response_tgt_attention_mask[idx:idx+1, start:end] = 1
-                        sft_blocks_inputs.batch['tgt_attention_mask'] = torch.cat(
-                            [sft_blocks_inputs.batch['tgt_attention_mask'], response_tgt_attention_mask], dim=-1
-                        )
+                    # with marked_timer("after updated evaluation", timing_raw, "red"):
+                    #     gen_batch_output = self.async_actor_rollout_manager.generate_sequences(gen_batch_copy)
+                    #     reward_extra_info = gen_batch_output.non_tensor_batch["reward_extra_info"]
+                    #     correct_num = 0
+                    #     # 获取旧score
+                    #     old_scores = batch.non_tensor_batch["score"].tolist()
+                    #     new_scores = []
+                    #     for extra_info in reward_extra_info:
+                    #         # print(f"score: {extra_info['score']}, solution str: {extra_info['solution_str']}, "
+                    #         #       f"ground truth: {extra_info['ground_truth']}")
+                    #         # print(f"response str: {[extra_info['response_str']]}")
+                    #         new_scores.append(extra_info["score"])
+                    #         if extra_info["score"] > 0:
+                    #             correct_num += 1
+                    #     after_correct_ratio = correct_num / len(reward_extra_info)
+                    #     # print("after correct ratio: ", )
+                    #     metrics.update({"critic/acc/after_sft": after_correct_ratio})
+                    #     detailed_score_change = []
+                    #     for i in range(len(new_scores)//8):
+                    #         new_score = sum(new_scores[i*8:(i+1)*8])
+                    #         old_score = sum(old_scores[i*8:(i+1)*8])
+                    #         added_score = new_score - old_score
+                    #         detailed_score_change.append({"added_score": added_score, "updated_times": sft_indexes.get(i, 0)})
+                    #         # print("added score: ", added_score, " updated times: ", sft_indexes.get(i, 0))
+                    #     reward_before_after_sft = {"before reward": pre_correct_ratio,
+                    #                                "after reward": after_correct_ratio,
+                    #                                "detailed score change": detailed_score_change}
+                    #     with open(f'self_explain_examples/score_change/{self.global_steps}.json', 'w', encoding='utf-8') as f:
+                    #         f.write(json.dumps(reward_before_after_sft, ensure_ascii=False, indent=4))
 
-                        # for idx in range(sft_blocks_inputs.batch['tgt_attention_mask'].shape[0]):
-                        #     print('tgt attention mask: ', sft_blocks_inputs.batch['tgt_attention_mask'][idx:idx+1, prompt_length:].sum())
-                        #     print('rl attention mask: ', sft_blocks_inputs.batch['attention_mask'][idx:idx+1, prompt_length:].sum())
+                    # with marked_timer("prob change evaluation", timing_raw, "red"):
+                    #     log_prob_after, _ = self._compute_old_log_prob(prob_cal_data)
+                    #     log_prob_after = log_prob_after.batch["old_log_probs"]
+                    #
+                    # diff = (log_prob_after.float() - log_prob_before.float()).abs()
+                    # print("max abs diff:", diff.max().item(), "mean abs diff:", diff.mean().item())
+                    # print("num changed:", (diff > 0).sum().item())
+                    # before_after_prob_data = []
+                    # for i in range(log_prob_after.shape[0]):
+                    #     tmp_attention_mask = prob_attention_mask[i]
+                    #     if tmp_attention_mask.sum() == 0:
+                    #         continue
+                    #     before_prob = log_prob_before[i][tmp_attention_mask == 1]
+                    #     after_prob = log_prob_after[i][tmp_attention_mask == 1]
+                    #     before_prob_list = before_prob.tolist()
+                    #     after_prob_list = after_prob.tolist()
+                    #     before_after_prob_data.append({
+                    #         "before_prob": before_prob_list,
+                    #         "after_prob": after_prob_list,
+                    #     })
+                    #     before_prob_overall = torch.exp(before_prob.mean())
+                    #     after_prob_overall = torch.exp(after_prob.mean())
+                    #     print(f"before prob: {before_prob_overall}, after prob: {after_prob_overall}")
+                    #     before_prob_first = torch.exp(before_prob[0])
+                    #     after_prob_first = torch.exp(after_prob[0])
+                    #     print(f"before prob first token: {before_prob_first}, after prob first token: {after_prob_first}")
+                    # with open("before_after_prob.json", "w") as f:
+                    #     json.dump(before_after_prob_data, f, indent=4)
+                    # exit(0)
 
-                    with marked_timer("dynamic sft", timing_raw, "red"):
-                        sft_blocks_inputs.meta_info = batch.meta_info
-                        sft_blocks_inputs.meta_info['calculate_rl_loss'] = True
-                        sft_blocks_inputs.meta_info['calculate_sft_loss'] = True
-                        sft_output = self.actor_rollout_wg.update_actor(sft_blocks_inputs)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, "red"):
-                            # print('batch before update actor ', batch)
-                            # print(f' need_analyze_gradients: {self.config.trainer.need_analyze_gradients}')
-                            # print(f' save  gradients freq: {self.config.trainer.analyze_gradients_freq}')
-                            if self.global_steps % self.config.trainer.get('analyze_gradients_freq', 10) == 0:
-                                batch.meta_info['step_index'] = self.global_steps
-                                if self.config.trainer.get('need_analyze_sft_grads', False):
-                                    batch.meta_info['need_analyze_sft_grads'] = True
-                                if self.config.trainer.get('need_analyze_off_grads', False):
-                                    batch.meta_info['need_analyze_off_grads'] = True
-                            if self.config.actor_rollout_ref.rollout.n_off_policy > 0:
-                                batch.meta_info['contain_off_policy'] = True
-                            batch.meta_info['calculate_sft_loss'] = False
-                            batch.meta_info['calculate_rl_loss'] = True
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                    # update actor
+                    with marked_timer("update_actor", timing_raw, "red"):
+                        # print('batch before update actor ', batch)
+                        # print(f' need_analyze_gradients: {self.config.trainer.need_analyze_gradients}')
+                        # print(f' save  gradients freq: {self.config.trainer.analyze_gradients_freq}')
+                        if self.global_steps % self.config.trainer.get('analyze_gradients_freq', 10) == 0:
+                            batch.meta_info['step_index'] = self.global_steps
+                            if self.config.trainer.get('need_analyze_sft_grads', False):
+                                batch.meta_info['need_analyze_sft_grads'] = True
+                            if self.config.trainer.get('need_analyze_off_grads', False):
+                                batch.meta_info['need_analyze_off_grads'] = True
+                        if self.config.actor_rollout_ref.rollout.n_off_policy > 0:
+                            batch.meta_info['contain_off_policy'] = True
+                        batch.meta_info['calculate_sft_loss'] = False
+                        batch.meta_info['calculate_rl_loss'] = True
+                        actor_output = self.actor_rollout_wg.update_actor(sft_data_to_update)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_output_metrics)
 
                     # validate
-                    if (
-                        self.val_reward_fn is not None
-                        and self.config.trainer.test_freq > 0
-                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                    ):
-                        with marked_timer("testing", timing_raw, "green"):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
-
+                    # if (
+                    #     self.val_reward_fn is not None
+                    #     and self.config.trainer.test_freq > 0
+                    #     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    # ):
+                    #     with marked_timer("testing", timing_raw, "green"):
+                    #         val_metrics: dict = self._validate()
+                    #         if is_last_step:
+                    #             last_val_metrics = val_metrics
+                    #     metrics.update(val_metrics)
+                    #
                     if self.config.trainer.save_freq > 0 and (
                         is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                     ):
@@ -1297,19 +1406,6 @@ class RayMixedTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
-
-    def general_reasoner_compute_score(
-        self,
-        solution_str,
-    ):
-        solution_slices = solution_str.strip().split('\n')
-        final_decision = solution_slices[-1].strip()
-        if final_decision == 'Final Decision: Yes':
-            return 1
-        elif final_decision == 'Final Decision: No':
-            return -1
-        else:
-            return 0
 
     def _validate(self):
         reward_tensor_lst = []
