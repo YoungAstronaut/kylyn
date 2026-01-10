@@ -168,6 +168,7 @@ class TaskRunner:
             sample_target_ratio=config.data.sample_target_ratio,
         )
         print('reward func: ', reward_fn)
+        config.se_rollout_worker.rollout.temperature = 0.2
         config.se_loop_manager_config.actor_rollout_ref.rollout = config.se_rollout_worker.rollout
         config.se_loop_manager_config.actor_rollout_ref.model = config.se_rollout_worker.model
         config.se_loop_manager_config.trainer = config.trainer

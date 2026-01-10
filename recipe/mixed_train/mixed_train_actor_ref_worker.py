@@ -90,13 +90,3 @@ class MixedTrainActorRefWorker(AsyncActorRolloutRefWorker):
             self.actor = MixedTrainParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
-
-        if self._is_actor:
-            self.flops_counter = FlopsCounter(self.actor_model_config)
-            self.checkpoint_manager = FSDPCheckpointManager(
-                model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
-                lr_scheduler=self.actor_lr_scheduler,
-                processing_class=self.processor if self.processor is not None else self.tokenizer,
-                checkpoint_config=self.config.actor.checkpoint,
-            )

@@ -33,7 +33,7 @@ done
 
 calculate_rl_loss=${calculate_rl_loss:-"True"}
 calculate_sft_loss=${calculate_sft_loss:-"False"}
-sft_coef=2.0
+sft_coef=0.5
 
 nnodes=1
 n_gpus_per_node=${devices_num}
@@ -56,7 +56,7 @@ output_path=$HOME/jyh/verl/output
 set -xeuo pipefail
 
 project_name=kyrie
-experiment_name=only_psft_2.0
+experiment_name=mixed_sft_0.5_all_dft
 
 
 use_kl_in_reward=False
@@ -81,7 +81,7 @@ train_prompt_bsz=128  # train_batch_size
 gen_prompt_bsz=128
 n_resp_per_prompt=8
 n_off_policy=0
-ppo_mini_bsz=128
+ppo_mini_bsz=64
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -149,7 +149,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.model.path="${model_path}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
@@ -193,9 +193,6 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.test_freq=5 \
     trainer.save_freq=20 \
     trainer.total_epochs=1 \
-    trainer.need_analyze_sft_grads=False \
-    trainer.need_analyze_off_grads=False \
-    trainer.analyze_gradients_freq=30 \
     trainer.llm_error_localization=False \
     trainer.default_local_dir="${default_local_dir}" \
     trainer.resume_mode=auto 2>&1 | tee ${log_filename}

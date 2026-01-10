@@ -81,7 +81,7 @@ se_rollout_worker:
     response_length: 256 # 这个就是模型self explain的长度
     skip_tokenizer_init: True
     tensor_model_parallel_size: 2
-    temperature: 1.0
+    temperature: 0.2
     top_k: -1
     top_p: 1.0
     log_prob_micro_batch_size: null
@@ -95,13 +95,15 @@ se_rollout_worker:
       enable: False
     agent:
       _target_: verl.workers.config.AgentLoopConfig
-      default_agent_loop: single_turn_agent
+      default_agent_loop: single_se_agent
       num_workers: 1
       agent_loop_config_path: null
 
 se_loop_manager_config:
   data:
     gen_batch_size: 1
+    apply_chat_template_kwargs:
+      continue_final_message: True
   trainer: 
     n_gpus_per_node: ???
     nnodes: ???
@@ -157,3 +159,4 @@ trainer:
   analyze_gradients_freq: 10
   llm_error_localization: False
   max_blocks_num: 8 # 一个控制块的token数量，算法优化的参数
+  pure_rl_steps: 0

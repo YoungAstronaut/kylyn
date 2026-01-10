@@ -175,8 +175,8 @@ class Block:
     start: int
     end: int            # exclusive
     peak_idx: int
-    mean_entropy: float
-    max_entropy: float
+    mean_entropy: float = 0.0
+    max_entropy: float = 0.0
     sim_to_query: Optional[float] = None
     sim_to_refs: Optional[float] = None
     trigger_sft: bool = False
@@ -849,8 +849,6 @@ def split_into_blocks(complete_sentence: str, tokens: list[str], max_span: int):
     for split in sentences_splits:
         if split[0] == 'text':
             text_splits.append(split[1])
-    # print('length of all blocks: ', len(sentences_splits))
-    # print('length of text blocks: ', len(text_splits))
     step_blocks = locate_substrings(tokens, text_splits)
 
     assert len(step_blocks) == len(text_splits), f'step_blocks:\n {step_blocks} \n text_splits:\n {text_splits}\n tokens: \n {tokens}'
@@ -868,8 +866,8 @@ def split_into_blocks(complete_sentence: str, tokens: list[str], max_span: int):
     return filtered_segments, filtered_texts_splits
 
 def merge_segments_by_prob(segments: list[tuple[int, int]], texts_splits: list[str], probs: list[tuple[float, float]], max_span: int=256):
-    assert len(segments) == len(texts_splits), f'segments: {segments} \n texts_splits: {texts_splits}'
-    assert len(segments) == len(probs), f'segments: {segments} \n probs: {probs}'
+    assert len(segments) == len(texts_splits), f'segments: {len(segments)} \n texts_splits: {len(texts_splits)}'
+    assert len(segments) == len(probs), f'segments: {len(segments)} \n probs: {len(probs)}'
     probs.append((0,0))
     merged_segments = []
     merged_texts = []
@@ -929,19 +927,15 @@ def _process_single_sequence(
         **kwargs
 ) -> List[Block]:
     """处理单个序列的辅助函数"""
-    # 这里实现原始 build_high_entropy_blocks 的逻辑，但使用张量操作
-    # 由于代码较长，以下只展示关键修改部分
-
-    # 提取参数
-    verbose = kwargs.get('verbose', True)
-    smooth_window = kwargs.get('smooth_window', 5)
-
-    # 平滑处理
-    Hs = _gaussian_like_smooth_tensor(entropies, w=smooth_window)
-
     blocks = []
 
     if block_split_mode == 'auto':
+        # 提取参数
+        verbose = kwargs.get('verbose', True)
+        smooth_window = kwargs.get('smooth_window', 5)
+
+        # 平滑处理
+        Hs = _gaussian_like_smooth_tensor(entropies, w=smooth_window)
         # 计算阈值
         if kwargs.get('seed_method') == "mean_std":
             # 创建有效值的mask（全部为True，因为我们已经过滤了无效值）
@@ -1096,7 +1090,6 @@ def _process_single_sequence(
                         Block(start=start, end=end, peak_idx=block.peak_idx, meta=block.meta,
                               mean_entropy=block.mean_entropy, max_entropy=block.max_entropy, text=sentence.strip())
                     )
-                    # print(f'after: {start} - {end}\t{sentence}')
                     if sentence.strip() != text.strip():
                         continue
                     else:
@@ -1109,18 +1102,25 @@ def _process_single_sequence(
         # segments, texts_splits = split_into_blocks(complete_sentence, tokens, max_span)
         segments, texts_splits = split_into_blocks(complete_sentence, tokens, 1)
         eos_prob_list = kwargs["eos_probs"].tolist()
+        # print("len of tokens: ", len(tokens), " length of eos probs: ", len(eos_prob_list))
 
         probs = []
         for i in range(len(segments)):
             start, end = segments[i] # start, end是左闭右开区间
             if i == 0:
-                probs.append((0, eos_prob_list[end-1]))
+                if end > len(eos_prob_list):
+                    print("WARNING: ", "len of tokens: ", len(tokens), " length of eos probs: ", len(eos_prob_list))
+                    probs.append((0,eos_prob_list[-1]))
+                else:
+                    probs.append((0, eos_prob_list[end-1]))
             elif i == len(segments)-1:
                 probs.append((eos_prob_list[start], 0))
             else:
                 if end >= len(eos_prob_list):
                     segments = segments[:i]
                     texts_splits = texts_splits[:i]
+                    print("WARNING: ", "len of tokens: ", len(tokens), " length of eos probs: ", len(eos_prob_list),
+                          " index: ", i)
                     break
                 else:
                     probs.append((eos_prob_list[start], eos_prob_list[end-1]))
@@ -1131,22 +1131,43 @@ def _process_single_sequence(
             start = segment[0]
             end = segment[1]
             assert end > start, f'{segment} {text}'
-            average_entropy = sum(Hs[start:end])/(end-start)
-            max_entropy = max(Hs[start:end])
             blocks.append(
-                Block(start=start, end=end, peak_idx=-1, mean_entropy=average_entropy, max_entropy=max_entropy,
-                      text=text, meta={})
+                Block(start=start, end=end, peak_idx=-1, text=text, meta={})
             )
     else:
         raise ValueError(f"Invalid block_split_mode: {block_split_mode}")
 
     return blocks
 
-# ------- 小示例 -------
-if __name__ == "__main__":
-    sent = '''
-To solve the indefinite integral \(\int \frac{x}{\sqrt{x^4 - x^2 - 1}} \, dx\), we will follow these steps:
+def longest_common_substring(s1: str, s2: str) -> str:
+    """
+    Longest Common Substring (must be contiguous).
+    Returns one longest common substring (if multiple, returns one of them).
+    Time:  O(len(s1) * len(s2))
+    Space: O(min(len(s1), len(s2)))
+    """
+    if not s1 or not s2:
+        return ""
 
-1. **Substitution**: First, we can make a substitution to simplify the integral.'''
-    result = sent_tokenize(sent)
-    print(result)
+    # ensure s2 is the shorter string to reduce memory
+    if len(s2) > len(s1):
+        s1, s2 = s2, s1
+
+    m = len(s2)
+    prev = [0] * (m + 1)
+
+    best_len = 0
+    best_end = 0  # end position in s1 (exclusive)
+
+    for i in range(1, len(s1) + 1):
+        cur = [0] * (m + 1)
+        c1 = s1[i - 1]
+        for j in range(1, m + 1):
+            if c1 == s2[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best_len:
+                    best_len = cur[j]
+                    best_end = i
+        prev = cur
+
+    return s1[best_end - best_len: best_end]

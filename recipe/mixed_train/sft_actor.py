@@ -62,60 +62,6 @@ def gather_tgt_inputs(data) -> TensorDict | None:
 
     return TensorDict(out, batch_size=out["input_ids"].shape[0])
 
-import torch
-
-def compute_dft_loss(
-    log_prob: torch.Tensor,
-    mask: torch.Tensor,
-    loss_agg_mode: str,
-    dft_alpha: float = 0.5,       # 0 -> SFT, 1 -> DFT
-    eps: float = 1e-8,
-    normalize: bool = True,       # 保持尺度更稳定（建议 True）
-    debug: bool = False,
-):
-    """
-    log_prob: log p(y*_t | ...) for target tokens, shape (B, T)
-    mask:     0/1 mask, shape (B, T)
-    """
-    assert loss_agg_mode == "token-mean"
-    assert log_prob.shape == mask.shape
-
-    # token prob p_t = exp(log p_t); 用 float32 做 exp 更稳
-    p = torch.exp(log_prob.float()).clamp_min(eps).detach()  # sg(p)
-    if dft_alpha != 1.0:
-        # 平滑插值：α=0 完全不加权（SFT），α=1 完全 DFT
-        p = p.pow(dft_alpha)
-
-    p = p.to(log_prob.dtype)
-
-    # DFT: - sg(p) * log p
-    loss_mat = -(p * log_prob)
-
-    # 可选：归一化，使得整体 loss 尺度不因为平均 p 变小而整体变小
-    # 这对你“RL + SFT 混合”很关键，否则 SFT 梯度可能突然变弱/变强
-    if normalize:
-        denom = mask.sum().clamp_min(1).to(p.dtype)
-        p_mean = (p * mask).sum() / denom
-        loss_mat = loss_mat / p_mean.clamp_min(eps)
-
-    # token-mean（分母仍然是 token 数）
-    batch_num_tokens = mask.sum().detach().clamp_min(1)
-    loss = agg_loss(
-        loss_mat=loss_mat,
-        loss_mask=mask,
-        loss_agg_mode="token-mean",
-        batch_num_tokens=batch_num_tokens,
-    )
-
-    # 若没有有效 token，loss 应该是 0（这里给个兜底）
-    loss = loss * (batch_num_tokens > 0).to(loss.dtype)
-
-    if debug:
-        vt = int(batch_num_tokens.detach().cpu())
-        print(f"[DFT-SFT] valid_tokens={vt}, p_mean={float(p_mean.detach().cpu()) if normalize else 'n/a'}")
-
-    return loss
-
 def compute_sft_loss(log_prob, mask, loss_agg_mode, config=None, debug=False):
     assert loss_agg_mode == "token-mean"
     assert log_prob.shape == mask.shape
@@ -608,10 +554,10 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                 
                 total_rl_tokens = mini_batch.batch["response_mask"].sum().detach()
                 total_sft_tokens = mini_batch.batch["tgt_response_mask"].sum().detach()
-                # print(f"total_rl_tokens: {total_rl_tokens}, total_sft_tokens: {total_sft_tokens}")
+                print(f"total_rl_tokens: {total_rl_tokens}, total_sft_tokens: {total_sft_tokens}")
                 total_rl_tokens = total_rl_tokens.clamp_min(1)
                 total_sft_tokens = total_sft_tokens.clamp_min(1)
-                # print(f"total_rl_tokens: {total_rl_tokens}, total_sft_tokens: {total_sft_tokens}")
+                print(f"total_rl_tokens: {total_rl_tokens}, total_sft_tokens: {total_sft_tokens}")
 
                 # print("micro batch length: ", len(micro_batches))
                 for index, micro_batch in enumerate(micro_batches):
@@ -635,13 +581,13 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         # )
                         RL_KEYS = ["input_ids","attention_mask","position_ids","responses","response_mask","old_log_probs"]
                         forward_batch_data = micro_batch.batch.select(*RL_KEYS)
-                        # print("pre forward batch data: ", forward_batch_data)
-                        # print("tgt forward batch data: ", valid_tgt_input)
+                        print("pre forward batch data: ", forward_batch_data)
+                        print("tgt forward batch data: ", valid_tgt_input)
                         if valid_tgt_input is not None:
                             forward_batch_data = TensorDict.cat([forward_batch_data, valid_tgt_input], dim=0)
-                        #     print("forward batch data: ", forward_batch_data)
-                        # else:
-                        #     print("valid_tgt_input is None")
+                            print("forward batch data: ", forward_batch_data)
+                        else:
+                            print("valid_tgt_input is None")
                         # for i in range(forward_batch_data.batch_size[0]):
                             # print("attention mask valid num: ", forward_batch_data["attention_mask"][i][prompt_length:].sum(),
                             #     "response position ids: ", forward_batch_data["position_ids"][i][prompt_length:],
@@ -680,7 +626,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     if calculate_sft_loss:
                         logp_sft = all_log_prob[n_rl:]
                         mask_sft = forward_batch_data["response_mask"][n_rl:]
-                        sft_loss = compute_dft_loss(logp_sft, mask_sft, loss_agg_mode, config=self.config)
+                        sft_loss = compute_sft_loss(logp_sft, mask_sft, loss_agg_mode, config=self.config)
                     else:
                         sft_loss = torch.zeros((), device=all_log_prob.device, dtype=all_log_prob.dtype)
                     # print("sft loss: ", sft_loss)
@@ -737,10 +683,11 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         else:
                             w_sft = 0.0
                         
-                        # print("w_rl: ", w_rl, " w_sft: ", w_sft)
+                        print("w_rl: ", w_rl, " w_sft: ", w_sft)
 
+                        # 用“贡献权重”去加权各自的 token-mean loss
                         loss = w_rl * pg_loss + self.config.sft_loss_coef * w_sft * sft_loss
-                        # print("pg loss: ", pg_loss, " sft loss: ", sft_loss, " loss: ", loss)
+                        print("pg loss: ", pg_loss, " sft loss: ", sft_loss, " loss: ", loss)
 
                         if entropy_coeff != 0 and calculate_rl_loss:
                             loss = loss - entropy_coeff * w_rl * entropy_loss
@@ -775,10 +722,6 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics["actor/grad_norm"] = grad_norm.detach().item()
-                mini_batch_metrics["actor/total_rl_tokens"] = total_rl_tokens.item()
-                mini_batch_metrics["actor/total_rl_tokens_ratio"] = total_rl_tokens.item() / (total_rl_tokens.item() + total_sft_tokens.item())
-                mini_batch_metrics["actor/total_sft_tokens"] = total_sft_tokens.item()
-                mini_batch_metrics["actor/total_sft_tokens_ratio"] = total_sft_tokens.item() / (total_rl_tokens.item() + total_sft_tokens.item())
                 # print(f"mini batch {batch_idx} grad norm: ", grad_norm)
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
