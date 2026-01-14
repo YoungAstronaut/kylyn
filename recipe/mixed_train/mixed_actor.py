@@ -116,7 +116,7 @@ def compute_dft_loss(
 
     return loss
 
-def compute_sft_loss(log_prob, mask, loss_agg_mode, config=None, debug=False):
+def compute_sft_loss(log_prob, mask, loss_agg_mode, debug=False):
     assert loss_agg_mode == "token-mean"
     assert log_prob.shape == mask.shape
 
@@ -680,7 +680,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                     if calculate_sft_loss:
                         logp_sft = all_log_prob[n_rl:]
                         mask_sft = forward_batch_data["response_mask"][n_rl:]
-                        sft_loss = compute_dft_loss(logp_sft, mask_sft, loss_agg_mode, config=self.config)
+                        sft_loss = compute_dft_loss(logp_sft, mask_sft, loss_agg_mode)
                     else:
                         sft_loss = torch.zeros((), device=all_log_prob.device, dtype=all_log_prob.dtype)
                     # print("sft loss: ", sft_loss)

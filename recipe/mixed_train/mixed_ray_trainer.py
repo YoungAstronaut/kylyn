@@ -664,7 +664,7 @@ class RayMixedTrainer(RayPPOTrainer):
             # print("block_ids", block_ids.shape)
             block_attn_mask = torch.ones_like(block_ids)
             tgt_response = torch.cat([responses[raw_index][:start], block_ids], dim=-1)
-            tgt_loss_mask = torch.cat([ones_responses_mask[raw_index][:start], block_attn_mask], dim=-1)
+            tgt_loss_mask = torch.cat([zero_responses_mask[raw_index][:start], block_attn_mask], dim=-1)
 
             tgt_responses_list[raw_index] = tgt_response
             tgt_loss_mask_list[raw_index] = tgt_loss_mask
