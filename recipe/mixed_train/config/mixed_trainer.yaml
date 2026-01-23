@@ -13,6 +13,7 @@ data:
   max_target_length: 8192
   filter_targets: False
   sample_target_ratio: 1.0
+  filter_overlong_prompts: True
 
 custom_reward_function:
   custom_module: recipe.mixed_train.math_reward
@@ -78,7 +79,7 @@ se_rollout_worker:
     gpu_memory_utilization: 0.8
     log_prob_use_dynamic_bsz: True
     prompt_length: 8192
-    response_length: 256 # 这个就是模型self explain的长度
+    response_length: 128 # 这个就是模型self explain的长度
     skip_tokenizer_init: True
     tensor_model_parallel_size: 2
     temperature: 0.2
@@ -149,11 +150,14 @@ actor_rollout_ref:
     all_max_clip: -1
     loss_remove_token_mean: False
     loss_remove_clip: False
-    sft_loss_coef: 0.1 # 仅在calculate_sft_loss为True时生效
     calculate_rl_loss: True
+    sft_warmup_steps: 0
+    sft_decay_steps: 100
+    coef_peak: 1.0
+    coef_valley: 0.0
 
 trainer:
-  project_name: verl-dapo
+  project_name: verl
   need_analyze_sft_grads: False
   need_analyze_off_grads: False
   analyze_gradients_freq: 10

@@ -19,11 +19,6 @@ while [[ $# -gt 0 ]]; do
             echo "计算 SFT 损失: ${calculate_sft_loss}"
             shift 2
             ;;
-        --sft_coef)
-            sft_coef="$2"
-            echo "SFT 损失系数: ${sft_coef}"
-            shift 2
-            ;;
         *)
             echo "Unknown parameter: $1"
             exit 1
@@ -33,7 +28,6 @@ done
 
 calculate_rl_loss=${calculate_rl_loss:-"True"}
 calculate_sft_loss=${calculate_sft_loss:-"False"}
-sft_coef=0.5
 
 nnodes=1
 n_gpus_per_node=${devices_num}
@@ -56,7 +50,7 @@ output_path=$HOME/jyh/verl/output
 set -xeuo pipefail
 
 project_name=kyrie
-experiment_name=mixed_sft_0.5_all_dft
+experiment_name=part_dft_decay_30_p_0.5_v_0_128
 
 
 use_kl_in_reward=False
@@ -137,7 +131,6 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.actor.off_policy_normalize=False \
     actor_rollout_ref.actor.off_policy_reshape="p_div_p_0.1" \
     actor_rollout_ref.actor.calculate_sft_loss="${calculate_sft_loss}" \
-    actor_rollout_ref.actor.sft_loss_coef="${sft_coef}" \
     actor_rollout_ref.actor.calculate_rl_loss="${calculate_rl_loss}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -174,6 +167,10 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
     actor_rollout_ref.actor.loss_remove_token_mean=True \
+    actor_rollout_ref.actor.sft_decay_steps=30 \
+    actor_rollout_ref.actor.sft_warmup_steps=0 \
+    actor_rollout_ref.actor.coef_peak=0.5 \
+    actor_rollout_ref.actor.coef_valley=0 \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
@@ -191,7 +188,7 @@ python3 -m recipe.mixed_train.main_mixed_train \
     trainer.nnodes="${nnodes}" \
     trainer.val_before_train=False \
     trainer.test_freq=5 \
-    trainer.save_freq=20 \
+    trainer.save_freq=40 \
     trainer.total_epochs=1 \
     trainer.llm_error_localization=False \
     trainer.default_local_dir="${default_local_dir}" \

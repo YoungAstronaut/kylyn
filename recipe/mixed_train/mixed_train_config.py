@@ -22,8 +22,11 @@ class MixedTrainActorConfig(FSDPActorConfig):
     all_max_clip: float = -1
     loss_remove_token_mean: bool = False
     loss_remove_clip: bool = False
-    sft_loss_coef: float = 0.1 # 仅在calculate_sft_loss为True时生效
     calculate_rl_loss: bool = True
+    sft_warmup_steps: int = 0
+    sft_decay_steps: int = 100
+    coef_peak: float = 1.0
+    coef_valley: float = 0.0
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

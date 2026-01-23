@@ -2,6 +2,7 @@
 Single Process Actor
 """
 import logging
+import math
 import os
 from typing import Optional
 
@@ -62,7 +63,24 @@ def gather_tgt_inputs(data) -> TensorDict | None:
 
     return TensorDict(out, batch_size=out["input_ids"].shape[0])
 
-import torch
+def sft_coef_schedule_function(
+    global_step: int, sft_warmup_steps: int, sft_decay_steps: int, coef_peak: float, coef_valley: float
+) -> float:
+    """
+    Computes a cosine decay schedule with a warmup phase for the coef parameter.
+    """
+    # Warmup
+    if global_step < sft_warmup_steps:
+        return (global_step / sft_warmup_steps) *coef_peak
+
+    # Decay
+    if global_step >= (sft_warmup_steps + sft_decay_steps):
+        return coef_valley
+
+    adjusted_step = global_step - sft_warmup_steps
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * adjusted_step / sft_decay_steps))
+    decayed_coef = (coef_peak - coef_valley) * cosine_decay + coef_valley
+    return decayed_coef
 
 def compute_dft_loss(
     log_prob: torch.Tensor,
@@ -547,6 +565,12 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         if calculate_rl_loss is None:
             calculate_rl_loss = self.config.calculate_rl_loss
         # print(f"calculate_rl_loss: {calculate_rl_loss}")
+        global_steps = data.meta_info.get('global_steps', None)
+        assert global_steps is not None, "global_steps must be in data.meta_info"
+        # print(f"global_steps: {global_steps}")
+        sft_loss_coef = sft_coef_schedule_function(global_steps, self.config.sft_warmup_steps, 
+                            self.config.sft_decay_steps, self.config.coef_peak, self.config.coef_valley)
+        # print(f"sft_loss_coef: {sft_loss_coef}")
 
         # make sure we are in training mode
         self.actor_module.train()
@@ -577,10 +601,10 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
         mini_batches = select_data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
-        # if on_policy:
-            # print('num of mini batches is 1')
-        # else:
-            # print('num of mini batches: ', len(mini_batches))
+        if on_policy:
+            print('num of mini batches is 1')
+        else:
+            print('num of mini batches: ', len(mini_batches))
 
         metrics = {}
         # print(f"初始显存: {torch.cuda.memory_allocated(device=get_device_id()) / 1024**3:.2f} GB")
@@ -713,6 +737,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                                 # 也做 safe denom，彻底杜绝 0 分母
                                 den = rl_tokens_micro.clamp_min(1)
                                 entropy_loss = agg_loss(ent_rl, mask_rl, "token-mean", batch_num_tokens=den)
+                                # print("entropy loss: ", entropy_loss)
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         pg_loss = torch.zeros((), device=all_log_prob.device, dtype=all_log_prob.dtype)
@@ -739,7 +764,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         
                         # print("w_rl: ", w_rl, " w_sft: ", w_sft)
 
-                        loss = w_rl * pg_loss + self.config.sft_loss_coef * w_sft * sft_loss
+                        loss = w_rl * pg_loss + sft_loss_coef * w_sft * sft_loss
                         # print("pg loss: ", pg_loss, " sft loss: ", sft_loss, " loss: ", loss)
 
                         if entropy_coeff != 0 and calculate_rl_loss:
@@ -752,7 +777,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
                         else:
                             loss_scale_factor = 1 / self.gradient_accumulation
 
-                        all_loss = pg_loss + self.config.sft_loss_coef * sft_loss
+                        all_loss = pg_loss + sft_loss_coef * sft_loss
                         if entropy_coeff != 0 and calculate_rl_loss:
                             all_loss = all_loss - entropy_coeff * entropy_loss
                         loss = all_loss * loss_scale_factor
@@ -760,7 +785,7 @@ class MixedTrainParallelPPOActor(DataParallelPPOActor):
 
                     if calculate_sft_loss:
                         micro_batch_metrics["actor/sft_loss"] = sft_loss.detach().item() if sft_loss is not None else 0
-                        micro_batch_metrics["actor/sft_coef"] = self.config.sft_loss_coef
+                        micro_batch_metrics["actor/sft_coef"] = sft_loss_coef
 
                     if calculate_rl_loss:
                         if self.config.use_dynamic_bsz and loss_agg_mode == "token-mean":
