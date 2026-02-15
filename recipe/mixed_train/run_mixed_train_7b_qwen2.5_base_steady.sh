@@ -51,7 +51,7 @@ set -xeuo pipefail
 
 project_name=kyrie
 #experiment_name=part_decay_30_p_0.5_v_0.1_128 # 局部的dft, 峰值0.5, 谷值0.1
-experiment_name=part_decay_60_p_1.0_v_0_128 # 局部的dft, 峰值0.5, 谷值0.1
+experiment_name=part_steady_0.05_128_decay_60 # 局部的dft, 峰值0.5, 谷值0.1
 
 
 use_kl_in_reward=False
@@ -170,8 +170,8 @@ python3 -m recipe.mixed_train.main_mixed_train \
     actor_rollout_ref.actor.loss_remove_token_mean=True \
     actor_rollout_ref.actor.sft_decay_steps=60 \
     actor_rollout_ref.actor.sft_warmup_steps=0 \
-    actor_rollout_ref.actor.coef_peak=1.0 \
-    actor_rollout_ref.actor.coef_valley=0 \
+    actor_rollout_ref.actor.coef_peak=0.05 \
+    actor_rollout_ref.actor.coef_valley=0.0 \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
