@@ -275,21 +275,6 @@ class RayGRPOTrainer(RayPPOTrainer):
                             metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-
-                        # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm["norm_adv_by_std_in_grpo"]
                         batch = compute_advantage(
                             batch,
