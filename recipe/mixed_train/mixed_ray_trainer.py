@@ -521,6 +521,7 @@ class RayMixedTrainer(RayPPOTrainer):
             else:
                 batch_splits = [balanced_batch] * embedding_group_num
 
+            # print("batch splits: ", batch_splits)
             similarity_results = []
             outputs = self.embedding_wg.calculate_similarity(batch_splits)
             if self.config.trainer.get("split_blocks", False):
@@ -569,29 +570,19 @@ class RayMixedTrainer(RayPPOTrainer):
         return error_blocks
 
     def divide_answers_blocks(self, data: DataProto, reward_tensor=None, eos_probs=None):
-        """
-        从 data 中的回答序列里，根据 token 熵和 reward 选出需要处理的高熵 token block。
-        只对“整体 reward < 0”的样本进行 block 提取。
-        最终结果写回 data.non_tensor_batch['parsed_blocks']。
-        """
-
         # responses: (batch_size, seq_len) 的 token id
         responses: torch.Tensor = data.batch['responses']
         batch_size, seq_len = responses.shape
 
-        # -----------------------------
-        # 1. 计算每个样本的“序列级 reward”，再广播到每个 token
-        # -----------------------------
         if reward_tensor is None:
             # data.batch['token_level_scores']: 一般是 (B, T_token)，在 dim=-1 上求和得到每个样本一个标量
             seq_scores = data.batch['token_level_scores'].sum(dim=-1, keepdim=True)  # (B, 1)
+            # print("seq scores: ", seq_scores)
         else:
             # reward_tensor 可能是 (B, T) 或 (B,)
             if reward_tensor.dim() == 1:
-                # (B,) -> (B, 1)
                 seq_scores = reward_tensor.unsqueeze(1)
             else:
-                # (B, T_token) -> (B, 1)
                 seq_scores = reward_tensor.sum(dim=-1, keepdim=True)
 
         # 把每个样本的序列级 reward 广播到 seq_len 长度，得到 (B, seq_len)
@@ -605,7 +596,7 @@ class RayMixedTrainer(RayPPOTrainer):
         ).to(dtype=torch.int32)
 
         # 只处理“序列总 reward < 0”的样本中的有效 token
-        negative_seq_mask = (seq_scores < 0).to(dtype=torch.int32)  # (B, seq_len)
+        negative_seq_mask = (seq_scores <= 0).to(dtype=torch.int32)  # (B, seq_len)
         process_mask = negative_seq_mask * response_mask  # (B, seq_len)
 
         # 3. 取出熵，并做一下形状校验
@@ -853,12 +844,9 @@ class RayMixedTrainer(RayPPOTrainer):
                 # interleave==True: [a, b] -> [a, a, b, b]
                 # interleave==False: [a, b] -> [a, b, a, b]
                 gen_batch = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n-self.config.actor_rollout_ref.rollout.n_off_policy, 
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, 
                     interleave=True
                 )
-
-                import copy
-                gen_batch_copy = copy.deepcopy(gen_batch)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1025,7 +1013,6 @@ class RayMixedTrainer(RayPPOTrainer):
 
                         new_batch.batch["token_level_rewards"] = reward_tensor
                         # print(reward_tensor.sum(-1))
-                        # print(f'error blocks: {error_blocks}')
 
                         if reward_extra_infos_dict:
                             new_batch.non_tensor_batch.update(
@@ -1093,6 +1080,7 @@ class RayMixedTrainer(RayPPOTrainer):
                     sft_indexes = {}
                     with marked_timer("sft_blocks_prepare", timing_raw, "green"):
                         error_type = batch.non_tensor_batch["error_type"]
+                        # print("error blocks: ", error_blocks)
                         self_explain_inputs = self.gather_self_explain_input(batch, error_blocks, error_type)
                         self_explain_samples_num = self_explain_inputs.batch.batch_size[0]
                         self_explain_inputs.pop(batch_keys=["input_ids", "attention_mask"])
@@ -1152,6 +1140,15 @@ class RayMixedTrainer(RayPPOTrainer):
 
                         sft_data_to_update = self.construct_sft_data_to_update(batch, self_explain_result, error_blocks)
                         # print(f"sft_data_to_update: {sft_data_to_update}")
+                        # filter
+                        # filter_num = 0
+                        for i in range(sft_data_to_update.batch.batch_size[0]):
+                            uid = batch.non_tensor_batch["uid"][i]
+                            if id2correct_num[uid] > 0:
+                                # if sft_data_to_update.batch["tgt_response_mask"][i:i+1, ...].sum().item() > 0:
+                                #     filter_num += 1
+                                sft_data_to_update.batch["tgt_response_mask"][i:i+1, ...] = torch.zeros_like(sft_data_to_update.batch["tgt_response_mask"][i:i+1, ...])
+                        # print("filter num: ", filter_num)
                         batch.pop(batch_keys=["tgt_input_ids","tgt_attention_mask","tgt_responses"])
                         batch = batch.union(sft_data_to_update)
                         # tgt_responses = sft_data_to_update.batch["tgt_responses"]
