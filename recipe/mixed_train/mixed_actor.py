@@ -86,7 +86,7 @@ def compute_dft_loss(
     log_prob: torch.Tensor,
     mask: torch.Tensor,
     loss_agg_mode: str,
-    dft_alpha: float = 0.5,       # 0 -> SFT, 1 -> DFT
+    dft_alpha: float = 1.0,       # 0 -> SFT, 1 -> DFT
     eps: float = 1e-8,
     normalize: bool = True,       # 保持尺度更稳定（建议 True）
     debug: bool = False,
