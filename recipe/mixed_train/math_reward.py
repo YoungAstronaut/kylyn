@@ -34,7 +34,7 @@ def math_verify_compute_score(
             return ''.join([str(item) for item in _ground_truth])
         else:
             raise NotImplementedError
-    res = -1.0
+    res = 0.0
     response_str = solution_str
     solution_str = ""
     if '<think>' in response_str and '</think>' in response_str:
@@ -74,7 +74,7 @@ def math_verify_compute_score(
     else:
         if solution_str == None:
             print("\033[31mthis solution is None!\033[0m")
-            res = -1.0
+            res = 0.0
             return res
 
         # 容错判断：有的ground_truth是字符串，有的ground_truth是列表，最终都转换成列表
@@ -86,7 +86,7 @@ def math_verify_compute_score(
             raise NotImplementedError
         ground_truth = [last_boxed_only_string(item) for item in ground_truth]
         if len(ground_truth) == 0:
-            res = -1.0
+            res = 0.0
         else:
             for gt in ground_truth:
                 if gt == None:
@@ -95,7 +95,7 @@ def math_verify_compute_score(
                     res = 1.0
                     break
                 else:
-                    res = -1.0
+                    res = 0.0
     return {"score": res, "response_str": response_str, "solution_str": solution_str,
             "ground_truth": ground_truth_str(ground_truth), "error_type": "incorrect_answer"}
 
@@ -187,7 +187,7 @@ class RuleBasedRewardManager(AbstractRewardManager):
             if '\\boxed' in response_str:
                 solution_str = last_boxed_only_string(response_str)
             if solution_str == '':
-                score = -1.0
+                score = 0.0
                 # print('response not contain solution: ')
                 # print('response: ', response_str)
             else:
