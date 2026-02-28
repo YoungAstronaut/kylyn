@@ -51,7 +51,7 @@ set -xeuo pipefail
 
 project_name=kyrie
 #experiment_name=part_decay_30_p_0.5_v_0.1_128 # 局部的dft, 峰值0.5, 谷值0.1
-experiment_name=part_decay_60_p_1.0_v_0_128 # 局部的dft, 峰值0.5, 谷值0.1
+experiment_name=kyrie_decay_60_p_1.0_v_0_128 # 局部的dft, 峰值0.5, 谷值0.1
 
 
 use_kl_in_reward=False
