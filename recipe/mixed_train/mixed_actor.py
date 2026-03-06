@@ -88,14 +88,12 @@ def compute_dft_loss(
     loss_agg_mode: str,
     dft_alpha: float = 1.0,       # 0 -> SFT, 1 -> DFT
     eps: float = 1e-8,
-    normalize: bool = True,       # 保持尺度更稳定（建议 True）
-    debug: bool = False,
 ):
     """
     log_prob: log p(y*_t | ...) for target tokens, shape (B, T)
     mask:     0/1 mask, shape (B, T)
     """
-    assert loss_agg_mode == "token-mean"
+    assert loss_agg_mode == "seq-mean-token-mean"
     assert log_prob.shape == mask.shape
 
     # token prob p_t = exp(log p_t); 用 float32 做 exp 更稳
@@ -109,28 +107,11 @@ def compute_dft_loss(
     # DFT: - sg(p) * log p
     loss_mat = -(p * log_prob)
 
-    # 可选：归一化，使得整体 loss 尺度不因为平均 p 变小而整体变小
-    # 这对你“RL + SFT 混合”很关键，否则 SFT 梯度可能突然变弱/变强
-    if normalize:
-        denom = mask.sum().clamp_min(1).to(p.dtype)
-        p_mean = (p * mask).sum() / denom
-        loss_mat = loss_mat / p_mean.clamp_min(eps)
-
-    # token-mean（分母仍然是 token 数）
-    batch_num_tokens = mask.sum().detach().clamp_min(1)
     loss = agg_loss(
         loss_mat=loss_mat,
         loss_mask=mask,
-        loss_agg_mode="token-mean",
-        batch_num_tokens=batch_num_tokens,
+        loss_agg_mode=loss_agg_mode,
     )
-
-    # 若没有有效 token，loss 应该是 0（这里给个兜底）
-    loss = loss * (batch_num_tokens > 0).to(loss.dtype)
-
-    if debug:
-        vt = int(batch_num_tokens.detach().cpu())
-        print(f"[DFT-SFT] valid_tokens={vt}, p_mean={float(p_mean.detach().cpu()) if normalize else 'n/a'}")
 
     return loss
 

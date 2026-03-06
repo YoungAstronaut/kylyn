@@ -68,7 +68,7 @@ enable_overlong_buffer=True
 overlong_buffer_len=8192
 overlong_penalty_factor=1.0
 
-loss_agg_mode="token-mean"
+loss_agg_mode="seq-mean-token-mean"
 
 enable_filter_groups=False
 filter_groups_metric=acc
